@@ -212,10 +212,18 @@ async def _review_single_pr(
 
     except AIReviewError as e:
         logger.error(f"AI review failed for PR #{pr_number}: {e}")
-        await gh.post_issue_comment(
-            token, repo_full_name, pr_number,
-            f"⚠️ @{contributor} — Automated review encountered an error. "
-            "A maintainer will review this PR manually."
+        # Only comment on PR if it came from a real webhook event, not a scan
+        # During scans, silent=True so we skip spamming every PR
+        if not silent:
+            await gh.post_issue_comment(
+                token, repo_full_name, pr_number,
+                f"⚠️ @{contributor} — Automated review encountered an error. "
+                "A maintainer will review this PR manually."
+            )
+        await _notify_telegram(
+            telegram_id,
+            f"❌ *AI Review Failed* on PR #{pr_number} in `{repo_full_name}`\n"
+            f"Error: {str(e)[:100]}\n{pr_url}",
         )
         return "ERROR"
 
