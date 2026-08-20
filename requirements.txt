@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+python-telegram-bot>=20.0
+httpx
+sqlalchemy
+aiosqlite
+cryptography
+python-dotenv
+greenlet
