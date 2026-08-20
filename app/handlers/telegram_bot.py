@@ -31,10 +31,11 @@ from app.services import github as gh
 logger = logging.getLogger(__name__)
 
 # Conversation states
-WAITING_FOR_TOKEN      = 1
-WAITING_FOR_REPO       = 2
+WAITING_FOR_TOKEN       = 1
+WAITING_FOR_REPO        = 2
 WAITING_FOR_REMOVE_REPO = 3
 WAITING_FOR_SCAN_CHOICE = 4
+WAITING_FOR_CLEAN_CHOICE = 5
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -112,7 +113,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "*Available Commands:*\n\n"
         "/setup — Connect your GitHub account\n"
         "/addrepo — Pick a repo from your GitHub to monitor\n"
-        "/scanrepo — Review all existing open PRs on a repo\n"
+        "/scanrepo — Review existing open PRs (5 at a time)\n"
+        "/cleanrepo — Delete spam comments the bot previously posted\n"
         "/listrepos — See your registered repos\n"
         "/removerepo — Remove a repo from monitoring\n"
         "/status — Check your account status\n"
@@ -411,8 +413,10 @@ async def receive_scan_choice(update: Update, context: ContextTypes.DEFAULT_TYPE
         return WAITING_FOR_SCAN_CHOICE
 
     repo_name = repos[int(text) - 1]
+    page = context.user_data.get("scan_page", 1)
+
     await update.message.reply_text(
-        f"⏳ Scanning `{repo_name}` for open PRs...", parse_mode="Markdown"
+        f"Scanning {repo_name} — batch {page} (up to 5 PRs)..."
     )
 
     user, token = await _get_user_and_token(telegram_id)
@@ -427,33 +431,93 @@ async def receive_scan_choice(update: Update, context: ContextTypes.DEFAULT_TYPE
             telegram_id=telegram_id,
             repo_full_name=repo_name,
             db=db,
+            page=page,
+            limit=5,
         )
 
     if not results:
-        await update.message.reply_text(
-            f"✅ No open PRs found on `{repo_name}`.", parse_mode="Markdown"
-        )
+        msg = "No open PRs found." if page == 1 else "No more PRs in this batch."
+        await update.message.reply_text(msg)
+        context.user_data.pop("scan_page", None)
         return ConversationHandler.END
 
-    icons  = {"MERGED": "✅", "COMMENTED": "🔍", "SKIPPED": "⚠️", "RATE_LIMITED": "⏳", "ERROR": "❌"}
     labels = {
         "MERGED":       "Merged",
         "COMMENTED":    "Needs changes — contributor tagged",
-        "SKIPPED":      "Skipped — no `Closes #issue`",
+        "SKIPPED":      "Skipped — no Closes #issue",
         "RATE_LIMITED": "AI limit hit — PR notified",
         "ERROR":        "Error — manual review needed",
     }
 
     lines = []
     for r in results:
-        icon  = icons.get(r["outcome"], "❓")
         label = labels.get(r["outcome"], r["outcome"])
-        lines.append(f"{icon} *PR #{r['pr_number']}* — {r['pr_title'][:40]}\n   ↳ {label}")
+        lines.append(f"PR #{r['pr_number']} — {r['pr_title'][:40]}\n   {label}")
+
+    context.user_data["scan_page"] = page + 1
+
+    rate_limited = any(r["outcome"] == "RATE_LIMITED" for r in results)
+    footer = (
+        "\n\nAI quota exhausted. Try /scanrepo again tomorrow to continue."
+        if rate_limited
+        else f"\n\nRun /scanrepo again to scan the next 5 PRs (batch {page + 1})."
+    )
 
     await update.message.reply_text(
-        f"*Scan complete — {repo_name}*\n_{len(results)} PR(s) reviewed_\n\n"
-        + "\n\n".join(lines),
-        parse_mode="Markdown",
+        f"Scan complete — {repo_name} (batch {page})\n"
+        f"{len(results)} PR(s) reviewed\n\n"
+        + "\n\n".join(lines)
+        + footer,
+    )
+    return ConversationHandler.END
+
+
+# ── /cleanrepo ────────────────────────────────────────────────────────────────
+async def cleanrepo_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    telegram_id = str(update.effective_user.id)
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(Repo).where(Repo.telegram_id == telegram_id, Repo.active == True)
+        )
+        repos = result.scalars().all()
+
+    if not repos:
+        await update.message.reply_text("You have no repos registered yet.")
+        return ConversationHandler.END
+
+    context.user_data["clean_repos"] = [r.full_name for r in repos]
+    await update.message.reply_text(
+        "Which repo do you want to clean spam comments from?\n\n"
+        + _numbered_list([r.full_name for r in repos])
+        + "\n\nReply with the number. Type /cancel to abort.",
+    )
+    return WAITING_FOR_CLEAN_CHOICE
+
+
+async def receive_clean_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    telegram_id = str(update.effective_user.id)
+    repos = context.user_data.get("clean_repos", [])
+    text = update.message.text.strip()
+
+    if not text.isdigit() or int(text) < 1 or int(text) > len(repos):
+        await update.message.reply_text(
+            f"Please reply with a number between 1 and {len(repos)}."
+        )
+        return WAITING_FOR_CLEAN_CHOICE
+
+    repo_name = repos[int(text) - 1]
+    await update.message.reply_text(f"Cleaning spam comments on {repo_name}...")
+
+    user, token = await _get_user_and_token(telegram_id)
+    if not user:
+        await update.message.reply_text("Please run /setup first.")
+        return ConversationHandler.END
+
+    from app.services.pr_reviewer import cleanup_spam_comments
+    deleted = await cleanup_spam_comments(token, telegram_id, repo_name)
+
+    await update.message.reply_text(
+        f"Done. Deleted {deleted} spam comment(s) from {repo_name}."
     )
     return ConversationHandler.END
 
@@ -517,6 +581,12 @@ def build_telegram_app() -> Application:
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
+    cleanrepo_conv = ConversationHandler(
+        entry_points=[CommandHandler("cleanrepo", cleanrepo_start)],
+        states={WAITING_FOR_CLEAN_CHOICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_clean_choice)]},
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("listrepos", list_repos))
@@ -525,5 +595,6 @@ def build_telegram_app() -> Application:
     app.add_handler(addrepo_conv)
     app.add_handler(removerepo_conv)
     app.add_handler(scanrepo_conv)
+    app.add_handler(cleanrepo_conv)
 
     return app

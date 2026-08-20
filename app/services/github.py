@@ -183,16 +183,57 @@ async def delete_webhook(token: str, repo: str, webhook_id: str) -> None:
         )
 
 
-async def get_open_prs(token: str, repo: str) -> list:
-    """Fetch all open PRs on a repo."""
+async def get_open_prs(token: str, repo: str, limit: int = 5, page: int = 1) -> list:
+    """Fetch open PRs on a repo — paginated, newest first."""
     async with httpx.AsyncClient() as client:
         r = await client.get(
             f"{GITHUB_API}/repos/{repo}/pulls",
             headers=_headers(token),
-            params={"state": "open", "per_page": 50},
+            params={
+                "state": "open",
+                "per_page": limit,
+                "page": page,
+                "sort": "created",
+                "direction": "desc",
+            },
         )
         r.raise_for_status()
         return r.json()
+
+
+async def delete_bot_comments(token: str, repo: str, texts_to_delete: list[str]) -> int:
+    """
+    Find and delete all issue/PR comments containing any of the given texts.
+    Returns the number of comments deleted.
+    """
+    deleted = 0
+    async with httpx.AsyncClient() as client:
+        # Fetch all comments on the repo (up to 100 pages)
+        page = 1
+        while True:
+            r = await client.get(
+                f"{GITHUB_API}/repos/{repo}/issues/comments",
+                headers=_headers(token),
+                params={"per_page": 100, "page": page},
+            )
+            if r.status_code != 200:
+                break
+            comments = r.json()
+            if not comments:
+                break
+            for comment in comments:
+                body = comment.get("body", "")
+                if any(text in body for text in texts_to_delete):
+                    del_r = await client.delete(
+                        f"{GITHUB_API}/repos/{repo}/issues/comments/{comment['id']}",
+                        headers=_headers(token),
+                    )
+                    if del_r.status_code == 204:
+                        deleted += 1
+            if len(comments) < 100:
+                break
+            page += 1
+    return deleted
 
 
 async def validate_token(token: str) -> Optional[str]:
