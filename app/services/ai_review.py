@@ -138,7 +138,10 @@ If not approved, the comment must:
                 .strip()
             )
 
+            logger.info(f"Gemini raw response: {raw_text[:500]}")
+
             result = json.loads(raw_text)
+            logger.info(f"Gemini decision: approved={result.get('approved')}, summary={result.get('summary','')[:100]}")
             return result
 
         except AIRateLimitError:
