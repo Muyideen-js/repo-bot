@@ -13,8 +13,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from app.models.database import init_db
+from app.config import validate_settings
 from app.handlers.webhook import router as webhook_router
 from app.handlers.telegram_bot import build_telegram_app
+from app.services.review_queue import review_worker, sync_registered_webhooks
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,7 +33,7 @@ async def lifespan(app: FastAPI):
     """Startup and shutdown lifecycle."""
     global telegram_app
 
-    # Initialize database
+    validate_settings()
     logger.info("Initializing database...")
     await init_db()
 
@@ -43,9 +45,17 @@ async def lifespan(app: FastAPI):
     await telegram_app.updater.start_polling(drop_pending_updates=True)
     logger.info("Telegram bot is running.")
 
+    stop_event = asyncio.Event()
+    worker_task = asyncio.create_task(review_worker(stop_event), name="review-worker")
+    hook_sync_task = asyncio.create_task(sync_registered_webhooks(), name="webhook-sync")
+
     yield
 
-    # Shutdown
+    stop_event.set()
+    await worker_task
+    if not hook_sync_task.done():
+        hook_sync_task.cancel()
+    await asyncio.gather(hook_sync_task, return_exceptions=True)
     logger.info("Shutting down Telegram bot...")
     await telegram_app.updater.stop()
     await telegram_app.stop()
