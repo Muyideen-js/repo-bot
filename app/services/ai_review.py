@@ -7,6 +7,8 @@ import os
 import httpx
 
 logger = logging.getLogger(__name__)
+_request_lock = asyncio.Lock()
+_next_request_at = 0.0
 GEMINI_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
     "gemini-2.5-flash:generateContent"
@@ -101,6 +103,7 @@ actionable corrections. When approved, clearly explain why the issue is solved.
     last_error = None
     for attempt in range(retries + 1):
         try:
+            await _wait_for_request_slot()
             async with httpx.AsyncClient(timeout=45) as client:
                 response = await client.post(
                     GEMINI_URL,
@@ -108,6 +111,7 @@ actionable corrections. When approved, clearly explain why the issue is solved.
                     json=payload,
                 )
             if response.status_code == 429:
+                await _apply_rate_limit_cooldown(response)
                 raise AIRateLimitError("Gemini quota exceeded")
             if response.status_code == 400:
                 message = str(response.json()).lower()
@@ -145,6 +149,32 @@ actionable corrections. When approved, clearly explain why the issue is solved.
             await asyncio.sleep(delay)
 
     raise AIReviewError(f"AI review failed after {retries + 1} attempts: {last_error}")
+
+
+async def _wait_for_request_slot() -> None:
+    """Globally pace Gemini calls so a repository scan cannot burst the API."""
+    global _next_request_at
+    interval = max(0.0, float(os.getenv("GEMINI_REQUEST_INTERVAL_SECONDS", "15")))
+    async with _request_lock:
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        if _next_request_at > now:
+            await asyncio.sleep(_next_request_at - now)
+            now = loop.time()
+        _next_request_at = now + interval
+
+
+async def _apply_rate_limit_cooldown(response: httpx.Response) -> None:
+    """Pause all subsequent Gemini calls after a 429, honoring Retry-After."""
+    global _next_request_at
+    try:
+        retry_after = float(response.headers.get("Retry-After", "60"))
+    except (TypeError, ValueError):
+        retry_after = 60.0
+    retry_after = max(60.0, retry_after)
+    async with _request_lock:
+        loop = asyncio.get_running_loop()
+        _next_request_at = max(_next_request_at, loop.time() + retry_after)
 
 
 def _validate_result(result: object) -> dict:

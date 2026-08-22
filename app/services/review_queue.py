@@ -12,6 +12,7 @@ from app.services.crypto import decrypt_token
 from app.services.pr_reviewer import notify_telegram, review_current_pr
 
 logger = logging.getLogger(__name__)
+_quota_notified_until: dict[str, datetime] = {}
 TERMINAL_RESULTS = {
     "MERGED", "MERGE_BLOCKED", "CHANGES_REQUESTED", "SKIPPED",
     "INVALID_ISSUE", "CLOSED",
@@ -38,12 +39,16 @@ async def enqueue_pr(repo_full_name: str, pr: dict, force: bool = False) -> bool
         job = result.scalar_one_or_none()
         if job:
             should_schedule = force or job.status == "FAILED"
-            if should_schedule or job.status == "QUEUED":
+            if should_schedule:
                 job.status = "QUEUED"
-                if should_schedule:
-                    job.attempts = 0
+                job.attempts = 0
                 job.next_attempt_at = datetime.utcnow()
                 job.last_error = None
+                await db.commit()
+            elif job.status == "QUEUED" and job.last_error == "WAITING_CI":
+                # CI events may wake CI-waiting work, but must not bypass an
+                # AI quota or transient-error cooldown.
+                job.next_attempt_at = datetime.utcnow()
                 await db.commit()
             return should_schedule
         db.add(ReviewJob(repo_full_name=repo_full_name, pr_number=number, head_sha=sha))
@@ -70,6 +75,7 @@ async def wake_jobs_for_sha(repo_full_name: str, sha: str) -> None:
             ReviewJob.repo_full_name == repo_full_name,
             ReviewJob.head_sha == sha,
             ReviewJob.status == "QUEUED",
+            ReviewJob.last_error == "WAITING_CI",
         ))
         for job in result.scalars():
             job.next_attempt_at = datetime.utcnow()
@@ -143,6 +149,7 @@ async def _process_job(job_id: int) -> None:
                 await _reschedule(job, db, 60 if outcome == "WAITING_CI" else 300, outcome)
             elif outcome == "RATE_LIMITED":
                 await _reschedule(job, db, 3600, outcome)
+                await _notify_quota_once(user.telegram_id, job.repo_full_name)
             elif outcome == "RETRY":
                 await _retry_or_fail(job, db, "AI review failed")
             elif outcome == "STALE":
@@ -194,6 +201,18 @@ async def _recover_interrupted_jobs() -> None:
             job.status = "QUEUED"
             job.next_attempt_at = datetime.utcnow()
         await db.commit()
+
+
+async def _notify_quota_once(telegram_id: str, repo_full_name: str) -> None:
+    now = datetime.utcnow()
+    if _quota_notified_until.get(telegram_id, datetime.min) > now:
+        return
+    _quota_notified_until[telegram_id] = now + timedelta(hours=1)
+    await notify_telegram(
+        telegram_id,
+        f"AI quota limit reached while reviewing {repo_full_name}. Remaining PRs "
+        "are still queued and will retry after the cooldown. Use /status for progress.",
+    )
 
 
 async def sync_registered_webhooks() -> None:
