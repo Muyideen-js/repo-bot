@@ -69,6 +69,7 @@ class FakeGeminiClient:
 async def test_gemini_key_is_sent_in_header_not_url(monkeypatch):
     client = FakeGeminiClient()
     monkeypatch.setenv("GEMINI_API_KEY", "secret-key")
+    monkeypatch.setenv("GEMINI_REQUEST_INTERVAL_SECONDS", "0")
     monkeypatch.setattr(ai_review.httpx, "AsyncClient", lambda **kwargs: client)
     result = await ai_review.review_pr("Issue", "Body", "PR", "Body", "diff", "success", "author")
     assert result["approved"] is False
