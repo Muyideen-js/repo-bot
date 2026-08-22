@@ -5,11 +5,13 @@ import re
 from datetime import datetime, timezone
 
 import httpx
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.database import PRLog
 from app.services import github as gh
 from app.services.ai_review import AIRateLimitError, AIReviewError, review_pr
+from app.services.conflict_repair import ConflictRepairError, repair_pull_request_conflicts
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +65,22 @@ async def review_current_pr(
     ci_status = await gh.get_ci_status(token, repo_full_name, current_sha)
     if ci_status == "pending" or (ci_status == "none" and _recently_updated(pr)):
         return "WAITING_CI"
+    previously_repaired = await _repair_count(db, repo_full_name, pr_number) > 0
+    if previously_repaired and ci_status in {"pending", "none"}:
+        # An AI-generated conflict resolution is never merged without fresh CI.
+        return "WAITING_CI"
+    if previously_repaired and ci_status == "failure":
+        summary = "Automatic conflict repair was pushed, but the repaired commit failed CI."
+        await _log(
+            db, repo_full_name, pr_number, pr_title, contributor,
+            "AUTO_REPAIR_CI_FAILED", summary,
+        )
+        await notify_telegram(
+            telegram_id,
+            f"PR #{pr_number} — AUTO REPAIR CI FAILED in {repo_full_name}\n"
+            f"{summary}\n{pr_url}",
+        )
+        return "AUTO_REPAIR_CI_FAILED"
 
     diff = await gh.get_pr_diff(token, repo_full_name, pr_number)
     try:
@@ -97,7 +115,19 @@ async def review_current_pr(
         merged = await gh.merge_pr(
             token, repo_full_name, pr_number, pr_title, expected_sha=expected_sha
         )
-        decision = "MERGED" if merged else "MERGE_BLOCKED"
+        if merged:
+            decision = "MERGED"
+        else:
+            decision, summary = await _repair_conflict_if_safe(
+                token=token,
+                repo_full_name=repo_full_name,
+                pr_number=pr_number,
+                expected_sha=expected_sha,
+                issue=issue,
+                pr=refreshed,
+                db=db,
+                current_summary=summary,
+            )
     else:
         await gh.post_review_comment(token, repo_full_name, pr_number, body=comment, approve=False)
         decision = "CHANGES_REQUESTED"
@@ -109,6 +139,76 @@ async def review_current_pr(
             f"PR #{pr_number} — {decision.replace('_', ' ')} in {repo_full_name}\n{summary}\n{pr_url}",
         )
     return decision
+
+
+async def _repair_conflict_if_safe(
+    token: str,
+    repo_full_name: str,
+    pr_number: int,
+    expected_sha: str,
+    issue: dict,
+    pr: dict,
+    db: AsyncSession,
+    current_summary: str,
+) -> tuple[str, str]:
+    """Repair only an actual Git conflict, never another merge-block reason."""
+    merge_state = await gh.get_pr_merge_state(token, repo_full_name, pr_number)
+    if merge_state != "dirty":
+        return "MERGE_BLOCKED", current_summary
+
+    max_repairs = max(1, int(os.getenv("AUTO_RESOLVE_MAX_ATTEMPTS", "2")))
+    repair_count = await _repair_attempt_count(db, repo_full_name, pr_number)
+    if repair_count >= max_repairs:
+        return (
+            "MERGE_BLOCKED",
+            f"The PR is correct but still conflicts after {repair_count} automatic repairs.",
+        )
+    try:
+        new_sha = await repair_pull_request_conflicts(
+            token=token,
+            repo_full_name=repo_full_name,
+            pr_number=pr_number,
+            expected_head_sha=expected_sha,
+            issue_title=issue.get("title", ""),
+            issue_body=issue.get("body") or "",
+            pr_title=pr.get("title", ""),
+            pr_body=pr.get("body") or "",
+        )
+    except ConflictRepairError as exc:
+        logger.error(
+            "Automatic conflict repair failed for %s#%s: %s",
+            repo_full_name, pr_number, exc,
+        )
+        return "MERGE_BLOCKED", f"Automatic conflict repair failed safely: {exc}"
+    return (
+        "CONFLICT_REPAIRED",
+        f"Resolved merge conflicts automatically in commit {new_sha[:12]}; waiting for fresh CI and review.",
+    )
+
+
+async def _repair_count(db: AsyncSession, repo: str, pr_number: int) -> int:
+    result = await db.execute(
+        select(func.count(PRLog.id)).where(
+            PRLog.repo_full_name == repo,
+            PRLog.pr_number == pr_number,
+            PRLog.decision == "CONFLICT_REPAIRED",
+        )
+    )
+    return int(result.scalar_one())
+
+
+async def _repair_attempt_count(db: AsyncSession, repo: str, pr_number: int) -> int:
+    result = await db.execute(
+        select(func.count(PRLog.id)).where(
+            PRLog.repo_full_name == repo,
+            PRLog.pr_number == pr_number,
+            or_(
+                PRLog.decision == "CONFLICT_REPAIRED",
+                PRLog.reason.like("Automatic conflict repair failed safely:%"),
+            ),
+        )
+    )
+    return int(result.scalar_one())
 
 
 def _recently_updated(pr: dict, grace_seconds: int = 120) -> bool:

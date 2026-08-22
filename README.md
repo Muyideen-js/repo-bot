@@ -26,7 +26,7 @@ and merges the exact reviewed commit when the change is complete.
 
 - `/setup` — connect or rotate the GitHub token
 - `/addrepo` — monitor a repository and scan all existing PRs
-- `/scanrepo` — discover all open PRs and retry only new or failed commits
+- `/scanrepo` — discover all open PRs and retry new, failed, or merge-blocked commits
 - `/listrepos` — list monitored repositories
 - `/removerepo` — remove the webhook and stop monitoring
 - `/status` — show monitored repositories and queued work
@@ -46,6 +46,9 @@ GEMINI_API_KEY=...
 GEMINI_REQUEST_INTERVAL_SECONDS=15
 AI_MAX_DIFF_CHARS=100000
 AI_MAX_OUTPUT_TOKENS=2048
+AI_CONFLICT_MAX_OUTPUT_TOKENS=8192
+AUTO_RESOLVE_CONFLICTS=true
+AUTO_RESOLVE_MAX_ATTEMPTS=2
 PUBLIC_URL=https://your-service.example
 GITHUB_WEBHOOK_SECRET=a-random-value-at-least-32-characters-long
 DATABASE_URL=postgresql://user:password@host/database
@@ -99,6 +102,10 @@ CI completion events.
 - The merge API is pinned to the reviewed SHA and still respects GitHub branch
   protection.
 - DeepSeek is primary and Gemini is fallback; failure of both keeps work queued.
+- Real Git conflicts are resolved on the PR branch when maintainers may edit it;
+  repaired commits must pass fresh CI and a complete second review before merge.
+- Conflict repair never executes PR code in the web service, never edits workflow
+  files, and stops after two attempts.
 - Model responses must match the expected types; invalid output never approves.
 
 AI review reduces maintainer work but is not a mathematical proof of correctness.

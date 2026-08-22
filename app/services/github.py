@@ -7,6 +7,7 @@ import hashlib
 import os
 import httpx
 import logging
+import asyncio
 from typing import Optional
 
 
@@ -217,6 +218,21 @@ async def merge_pr(
             },
         )
         return r.status_code == 200
+
+
+async def get_pr_merge_state(
+    token: str, repo: str, pr_number: int, attempts: int = 4
+) -> str:
+    """Wait briefly for GitHub's asynchronous mergeability calculation."""
+    state = "unknown"
+    for attempt in range(attempts):
+        pr = await get_pr(token, repo, pr_number)
+        state = pr.get("mergeable_state") or "unknown"
+        if state != "unknown" and pr.get("mergeable") is not None:
+            return state
+        if attempt < attempts - 1:
+            await asyncio.sleep(1)
+    return state
 
 
 async def register_webhook(token: str, repo: str, webhook_url: str, secret: str) -> str:

@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 _quota_notified_until: dict[str, datetime] = {}
 TERMINAL_RESULTS = {
     "MERGED", "MERGE_BLOCKED", "CHANGES_REQUESTED", "SKIPPED",
-    "INVALID_ISSUE", "CLOSED",
+    "INVALID_ISSUE", "CLOSED", "CONFLICT_REPAIRED", "AUTO_REPAIR_CI_FAILED",
 }
 
 
@@ -38,7 +38,7 @@ async def enqueue_pr(repo_full_name: str, pr: dict, force: bool = False) -> bool
         ))
         job = result.scalar_one_or_none()
         if job:
-            should_schedule = force or job.status == "FAILED"
+            should_schedule = _should_reschedule_existing_job(job, force)
             if should_schedule:
                 job.status = "QUEUED"
                 job.attempts = 0
@@ -58,6 +58,14 @@ async def enqueue_pr(repo_full_name: str, pr: dict, force: bool = False) -> bool
         except IntegrityError:
             await db.rollback()
             return False
+
+
+def _should_reschedule_existing_job(job: ReviewJob, force: bool) -> bool:
+    return (
+        force
+        or job.status == "FAILED"
+        or (job.status == "DONE" and job.last_error == "MERGE_BLOCKED")
+    )
 
 
 async def enqueue_all_open_prs(token: str, repo_full_name: str) -> tuple[int, int]:
@@ -155,6 +163,10 @@ async def _process_job(job_id: int) -> None:
             elif outcome == "STALE":
                 current = await gh.get_pr(token, job.repo_full_name, job.pr_number)
                 await _finish(job, db, "DONE", "Superseded by a newer commit")
+                await enqueue_pr(job.repo_full_name, current)
+            elif outcome == "CONFLICT_REPAIRED":
+                current = await gh.get_pr(token, job.repo_full_name, job.pr_number)
+                await _finish(job, db, "DONE", outcome)
                 await enqueue_pr(job.repo_full_name, current)
             else:
                 await _finish(job, db, "DONE", outcome)

@@ -20,3 +20,19 @@ async def test_scan_reports_discovered_and_actually_scheduled(monkeypatch):
     monkeypatch.setattr(review_queue, "enqueue_pr", fake_enqueue)
 
     assert await review_queue.enqueue_all_open_prs("token", "owner/repo") == (2, 1)
+
+
+@pytest.mark.parametrize(
+    "status,last_error,force,expected",
+    [
+        ("DONE", "MERGE_BLOCKED", False, True),
+        ("DONE", "MERGED", False, False),
+        ("FAILED", "error", False, True),
+        ("DONE", "MERGED", True, True),
+    ],
+)
+def test_only_retryable_existing_jobs_are_rescheduled(
+    status, last_error, force, expected
+):
+    job = type("Job", (), {"status": status, "last_error": last_error})()
+    assert review_queue._should_reschedule_existing_job(job, force) is expected
