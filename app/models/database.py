@@ -1,10 +1,14 @@
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, Text
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, Text, UniqueConstraint
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime
 import os
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./bot.db")
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
+elif DATABASE_URL.startswith("postgresql://"):
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
 
 engine = create_async_engine(DATABASE_URL, echo=False)
 AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
@@ -48,6 +52,25 @@ class PRLog(Base):
     decision = Column(String, nullable=False)                # MERGED | COMMENTED | SKIPPED
     reason = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class ReviewJob(Base):
+    """Durable, idempotent work item for one exact PR commit."""
+    __tablename__ = "review_jobs"
+    __table_args__ = (
+        UniqueConstraint("repo_full_name", "pr_number", "head_sha", name="uq_review_commit"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    repo_full_name = Column(String, nullable=False, index=True)
+    pr_number = Column(Integer, nullable=False)
+    head_sha = Column(String, nullable=False)
+    status = Column(String, nullable=False, default="QUEUED", index=True)
+    attempts = Column(Integer, nullable=False, default=0)
+    next_attempt_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    last_error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 async def init_db():

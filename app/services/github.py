@@ -20,7 +20,7 @@ def verify_webhook_signature(payload_bytes: bytes, signature_header: str) -> boo
     """Verify the request actually came from GitHub using the webhook secret."""
     secret = os.getenv("GITHUB_WEBHOOK_SECRET", "")
     if not secret:
-        return True  # skip verification in dev if secret not set
+        return False
     expected = "sha256=" + hmac.new(
         secret.encode(), payload_bytes, hashlib.sha256
     ).hexdigest()
@@ -77,24 +77,51 @@ async def get_issue(token: str, repo: str, issue_number: int) -> dict:
 
 
 async def get_ci_status(token: str, repo: str, sha: str) -> str:
-    """Return combined CI conclusion: success | failure | pending | none."""
+    """Return combined Checks API and commit-status state."""
     async with httpx.AsyncClient() as client:
-        r = await client.get(
+        checks_response = await client.get(
             f"{GITHUB_API}/repos/{repo}/commits/{sha}/check-runs",
             headers=_headers(token),
+            params={"per_page": 100, "page": 1},
         )
-        if r.status_code != 200:
-            return "none"
-        data = r.json()
-        runs = data.get("check_runs", [])
-        if not runs:
-            return "none"
-        statuses = [run["conclusion"] for run in runs if run["conclusion"]]
-        if all(s == "success" for s in statuses):
-            return "success"
-        if any(s in ("failure", "cancelled", "timed_out") for s in statuses):
+        status_response = await client.get(
+            f"{GITHUB_API}/repos/{repo}/commits/{sha}/status",
+            headers=_headers(token),
+        )
+        checks_data = checks_response.json() if checks_response.status_code == 200 else {}
+        runs = checks_data.get("check_runs", [])
+        total_runs = checks_data.get("total_count", len(runs))
+        page = 2
+        while len(runs) < total_runs:
+            page_response = await client.get(
+                f"{GITHUB_API}/repos/{repo}/commits/{sha}/check-runs",
+                headers=_headers(token),
+                params={"per_page": 100, "page": page},
+            )
+            if page_response.status_code != 200:
+                return "pending"
+            batch = page_response.json().get("check_runs", [])
+            if not batch:
+                return "pending"
+            runs.extend(batch)
+            page += 1
+        status_data = status_response.json() if status_response.status_code == 200 else {}
+        has_commit_statuses = bool(
+            status_data.get("total_count") or status_data.get("statuses")
+        )
+        combined_state = status_data.get("state") if has_commit_statuses else None
+        if any(run.get("status") != "completed" for run in runs):
+            return "pending"
+        failed = {"failure", "cancelled", "timed_out", "action_required", "startup_failure"}
+        if any(run.get("conclusion") in failed for run in runs):
             return "failure"
-        return "pending"
+        if combined_state in ("failure", "error"):
+            return "failure"
+        if combined_state == "pending":
+            return "pending"
+        if runs or combined_state == "success":
+            return "success"
+        return "none"
 
 
 def extract_issue_number(pr_body: str) -> Optional[int]:
@@ -139,13 +166,16 @@ async def post_issue_comment(
         r.raise_for_status()
 
 
-async def merge_pr(token: str, repo: str, pr_number: int, pr_title: str) -> bool:
-    """Merge the PR using regular merge strategy."""
+async def merge_pr(
+    token: str, repo: str, pr_number: int, pr_title: str, expected_sha: str
+) -> bool:
+    """Merge only if the PR still points at the reviewed commit."""
     async with httpx.AsyncClient() as client:
         r = await client.put(
             f"{GITHUB_API}/repos/{repo}/pulls/{pr_number}/merge",
             headers=_headers(token),
             json={
+                "sha": expected_sha,
                 "commit_title": f"Merge PR #{pr_number}: {pr_title}",
                 "merge_method": "merge",  # regular merge — preserves all commits
             },
@@ -162,7 +192,7 @@ async def register_webhook(token: str, repo: str, webhook_url: str, secret: str)
             json={
                 "name": "web",
                 "active": True,
-                "events": ["pull_request"],
+                "events": ["pull_request", "check_run", "check_suite", "status"],
                 "config": {
                     "url": webhook_url,
                     "content_type": "json",
@@ -173,6 +203,28 @@ async def register_webhook(token: str, repo: str, webhook_url: str, secret: str)
         )
         r.raise_for_status()
         return str(r.json()["id"])
+
+
+async def update_webhook(
+    token: str, repo: str, webhook_id: str, webhook_url: str, secret: str
+) -> None:
+    """Keep an existing hook aligned with the required event set."""
+    async with httpx.AsyncClient() as client:
+        r = await client.patch(
+            f"{GITHUB_API}/repos/{repo}/hooks/{webhook_id}",
+            headers=_headers(token),
+            json={
+                "active": True,
+                "events": ["pull_request", "check_run", "check_suite", "status"],
+                "config": {
+                    "url": webhook_url,
+                    "content_type": "json",
+                    "secret": secret,
+                    "insecure_ssl": "0",
+                },
+            },
+        )
+        r.raise_for_status()
 
 
 async def delete_webhook(token: str, repo: str, webhook_id: str) -> None:
@@ -199,6 +251,18 @@ async def get_open_prs(token: str, repo: str, limit: int = 5, page: int = 1) -> 
         )
         r.raise_for_status()
         return r.json()
+
+
+async def get_all_open_prs(token: str, repo: str) -> list:
+    """Fetch all currently open pull requests."""
+    pull_requests = []
+    page = 1
+    while True:
+        batch = await get_open_prs(token, repo, limit=100, page=page)
+        pull_requests.extend(batch)
+        if len(batch) < 100:
+            return pull_requests
+        page += 1
 
 
 async def delete_bot_comments(token: str, repo: str, texts_to_delete: list[str]) -> int:

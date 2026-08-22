@@ -7,3 +7,4 @@ aiosqlite
 cryptography
 python-dotenv
 greenlet
+asyncpg

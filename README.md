@@ -1,138 +1,98 @@
 # GitHub PR Review Bot
 
-An autonomous GitHub PR review bot with a Telegram interface. Users set up the bot via Telegram — it monitors their repos, reviews PRs using AI (Gemini 2.0 Flash), and either merges or requests changes automatically.
+A Telegram-controlled PR review service for contribution repositories such as
+GrantFox and Drips Wave. It monitors new and existing pull requests, compares
+each change with its linked issue, waits for CI, requests specific corrections,
+and merges the exact reviewed commit when the change is complete.
 
----
+## Review lifecycle
 
-## How It Works
+1. The maintainer connects a GitHub token with `/setup`.
+2. `/addrepo` installs a signed GitHub webhook and immediately queues every
+   existing open PR in the selected repository.
+3. New commits and completed CI checks enqueue or wake an idempotent review job.
+4. The worker refreshes the PR, requires `Closes #N`, `Fixes #N`, or
+   `Resolves #N`, loads the issue and diff, and combines GitHub Checks with
+   commit statuses.
+5. Gemini returns a validated, fail-closed review decision.
+6. Incomplete changes receive a review that tags the contributor and explains
+   what to fix. Complete changes are approved and merged only if the PR still
+   points to the reviewed SHA.
+7. Temporary GitHub, network, CI, or Gemini failures are retried from the
+   durable database queue. Final outcomes are sent to Telegram and audited.
 
-1. User DMs the bot on Telegram and runs `/setup`
-2. User provides their GitHub Personal Access Token (encrypted before storage)
-3. User runs `/addrepo owner/repo-name` to register a repo
-4. The bot registers a webhook on that repo via GitHub API
-5. When a PR is opened or updated:
-   - **No `Closes #issue`?** → Bot blocks merge, tags contributor, explains what to add
-   - **CI failing?** → Bot waits or requests fixes
-   - **AI reviews diff vs issue** → Approves & merges if complete, or requests specific changes
-6. Bot notifies the repo owner on Telegram with the outcome
+## Telegram commands
 
----
+- `/setup` — connect or rotate the GitHub token
+- `/addrepo` — monitor a repository and scan all existing PRs
+- `/scanrepo` — requeue all open PRs for a fresh review
+- `/listrepos` — list monitored repositories
+- `/removerepo` — remove the webhook and stop monitoring
+- `/status` — show monitored repositories and queued work
+- `/cleanrepo` — delete legacy bot error comments
+- `/help` and `/cancel`
 
-## Setup
+## Required environment variables
 
-### 1. Create a Telegram Bot
-- Message [@BotFather](https://t.me/BotFather) on Telegram
-- Run `/newbot` and follow the steps
-- Copy the `TELEGRAM_BOT_TOKEN`
+Copy `.env.example` to `.env` for local development. Never commit `.env`.
 
-### 2. Get a Gemini API Key
-- Go to [Google AI Studio](https://aistudio.google.com/app/apikey)
-- Create an API key
-- Copy the `GEMINI_API_KEY`
+```env
+TELEGRAM_BOT_TOKEN=...
+ENCRYPTION_KEY=...
+GEMINI_API_KEY=...
+PUBLIC_URL=https://your-service.example
+GITHUB_WEBHOOK_SECRET=a-random-value-at-least-32-characters-long
+DATABASE_URL=postgresql://user:password@host/database
+```
 
-### 3. Generate an Encryption Key
+Generate the Fernet encryption key with:
+
 ```bash
 python scripts/generate_key.py
 ```
-Copy the output as your `ENCRYPTION_KEY`.
 
-### 4. Set Environment Variables
-Copy `.env.example` to `.env` and fill in:
+The GitHub token needs access to repository contents, issues, pull requests,
+checks/statuses, webhook administration, and merging. A classic PAT generally
+uses `repo` and `write:repo_hook`; use narrowly scoped fine-grained permissions
+where the target organization supports them.
 
-```env
-TELEGRAM_BOT_TOKEN=your_telegram_bot_token
-ENCRYPTION_KEY=your_generated_fernet_key
-GEMINI_API_KEY=your_gemini_api_key
-PUBLIC_URL=https://your-bot.railway.app   # set after deployment
-GITHUB_WEBHOOK_SECRET=any_random_string_you_choose
-```
+## Run locally
 
-### 5. Deploy to Railway (Recommended)
-
-1. Push this repo to GitHub
-2. Go to [railway.app](https://railway.app) → New Project → Deploy from GitHub
-3. Add all environment variables in Railway's dashboard
-4. Copy the generated Railway URL into `PUBLIC_URL` in your env vars
-5. Redeploy
-
-### 6. Run Locally (Development)
 ```bash
-pip install -r requirements.txt
-cp .env.example .env   # fill in your values
-# Set PUBLIC_URL to your ngrok URL for local testing:
-# ngrok http 8000
+python -m pip install -r requirements-dev.txt
+python -m pytest -q
 uvicorn app.main:app --reload --port 8000
 ```
 
----
+Use an HTTPS tunnel as `PUBLIC_URL` when testing GitHub webhooks locally.
 
-## Telegram Commands
+## Deploy on Render
 
-| Command | Description |
-|---|---|
-| `/start` | Welcome message and instructions |
-| `/setup` | Connect your GitHub account |
-| `/addrepo` | Register a repo for PR monitoring |
-| `/listrepos` | List your monitored repos |
-| `/removerepo` | Remove a repo |
-| `/status` | Check your account setup |
-| `/help` | Show all commands |
+1. Create a managed PostgreSQL database. Do not use the default SQLite file in
+   production because a Render filesystem is ephemeral.
+2. Set every required environment variable in the web service. Use the external
+   PostgreSQL URL as `DATABASE_URL`.
+3. Use `pip install -r requirements.txt` as the build command.
+4. Use `uvicorn app.main:app --host 0.0.0.0 --port $PORT` as the start command.
+5. Run exactly one web-service instance. Telegram long polling and the queue
+   worker are intentionally single-instance in this version.
+6. Verify `GET /health`, then open Telegram and run `/setup` and `/addrepo`.
 
----
+On startup, the service updates previously registered hooks so they also receive
+CI completion events.
 
-## GitHub Token Permissions Required
+## Safety properties
 
-When creating your Personal Access Token (classic):
-- ✅ `repo` — full repository access (read PRs, issues, diffs, merge)
-- ✅ `write:repo_hook` — register webhooks on repos
+- GitHub tokens are encrypted at rest with Fernet.
+- Webhook verification fails closed if the secret is absent or incorrect.
+- Webhook requests return quickly after storing durable work.
+- Each repository/PR/SHA combination is idempotent in the queue.
+- Active, queued, failed, and completed work survives restarts with PostgreSQL.
+- CI cannot pass while any check is still running.
+- A push during review invalidates the decision.
+- The merge API is pinned to the reviewed SHA and still respects GitHub branch
+  protection.
+- Model responses must match the expected types; invalid output never approves.
 
----
-
-## PR Review Rules
-
-The bot will **NOT merge** if:
-- PR description has no `Closes #N`, `Fixes #N`, or `Resolves #N`
-- CI checks are failing
-- The AI determines the PR doesn't fully solve the linked issue
-- The PR introduces obvious regressions
-
-The bot **WILL merge** (regular merge) if:
-- PR links a valid issue with `Closes #N`
-- CI is passing (or no CI configured)
-- AI confirms every issue requirement is addressed in the diff
-- No regressions detected
-
----
-
-## Project Structure
-
-```
-pr-review-bot/
-├── app/
-│   ├── main.py                  # FastAPI app + Telegram bot startup
-│   ├── handlers/
-│   │   ├── telegram_bot.py      # Telegram commands and setup wizard
-│   │   └── webhook.py           # GitHub webhook receiver
-│   ├── services/
-│   │   ├── github.py            # All GitHub API calls
-│   │   ├── ai_review.py         # Gemini 2.0 Flash review engine
-│   │   ├── pr_reviewer.py       # Main PR review orchestrator
-│   │   └── crypto.py            # Token encryption/decryption
-│   └── models/
-│       └── database.py          # SQLAlchemy models (User, Repo, PRLog)
-├── scripts/
-│   └── generate_key.py          # One-time encryption key generator
-├── requirements.txt
-├── Procfile
-├── railway.toml
-└── .env.example
-```
-
----
-
-## Security
-
-- GitHub tokens are **encrypted with Fernet** before database storage
-- Webhook payloads are **signature-verified** against `GITHUB_WEBHOOK_SECRET`
-- Token messages from users are **deleted immediately** after receipt
-- Least-privilege: bot only needs `repo` + `write:repo_hook` permissions
+AI review reduces maintainer work but is not a mathematical proof of correctness.
+Keep branch protection, required CI, and repository-level merge rules enabled.

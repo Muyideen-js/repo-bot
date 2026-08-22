@@ -1,143 +1,104 @@
-"""
-Telegram bot interface.
-Users set up the bot here: provide GitHub token, add repos, remove repos.
-
-Commands:
-  /start      — welcome + instructions
-  /setup      — begin GitHub token setup
-  /addrepo    — pick a repo from your GitHub list to monitor
-  /listrepos  — show all registered repos
-  /removerepo — pick a repo from your list to remove
-  /scanrepo   — pick a repo to scan all existing open PRs
-  /status     — show bot status for your account
-  /help       — show all commands
-"""
-import os
+"""Telegram onboarding and control interface."""
 import logging
+import os
+
+import httpx
+from sqlalchemy import func, select
 from telegram import Update
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ConversationHandler,
-    ContextTypes,
-    filters,
+    Application, CommandHandler, ContextTypes, ConversationHandler,
+    MessageHandler, filters,
 )
-from sqlalchemy import select
-from app.models.database import AsyncSessionLocal, User, Repo
-from app.services.crypto import encrypt_token
+
+from app.models.database import AsyncSessionLocal, Repo, ReviewJob, User
 from app.services import github as gh
+from app.services.crypto import decrypt_token, encrypt_token
+from app.services.review_queue import enqueue_all_open_prs
 
 logger = logging.getLogger(__name__)
-
-# Conversation states
-WAITING_FOR_TOKEN       = 1
-WAITING_FOR_REPO        = 2
+WAITING_FOR_TOKEN = 1
+WAITING_FOR_REPO = 2
 WAITING_FOR_REMOVE_REPO = 3
 WAITING_FOR_SCAN_CHOICE = 4
 WAITING_FOR_CLEAN_CHOICE = 5
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
 async def _get_user_and_token(telegram_id: str):
-    """Return (user, plain_token) or (None, None) if not set up."""
     async with AsyncSessionLocal() as db:
         result = await db.execute(select(User).where(User.telegram_id == telegram_id))
         user = result.scalar_one_or_none()
-    if not user or not user.setup_complete:
+    if not user or not user.setup_complete or not user.github_token_encrypted:
         return None, None
-    from app.services.crypto import decrypt_token
     return user, decrypt_token(user.github_token_encrypted)
 
 
 async def _fetch_github_repos(token: str) -> list[str]:
-    """
-    Fetch all repos the token has push access to:
-    own repos + org repos + collaborator repos.
-    Returns list of 'owner/repo' strings.
-    """
-    import httpx
-    headers = {
-        "Authorization": f"token {token}",
-        "Accept": "application/vnd.github+json",
-    }
     repos = []
-    async with httpx.AsyncClient(timeout=15) as client:
-        # Own + org repos
-        page = 1
+    page = 1
+    async with httpx.AsyncClient(timeout=20) as client:
         while True:
-            r = await client.get(
+            response = await client.get(
                 "https://api.github.com/user/repos",
-                headers=headers,
-                params={"per_page": 100, "page": page, "affiliation": "owner,collaborator,organization_member"},
+                headers=gh._headers(token),
+                params={
+                    "per_page": 100,
+                    "page": page,
+                    "affiliation": "owner,collaborator,organization_member",
+                    "sort": "full_name",
+                },
             )
-            if r.status_code != 200:
-                break
-            data = r.json()
-            if not data:
-                break
-            for repo in data:
-                perms = repo.get("permissions", {})
-                if perms.get("push") or perms.get("admin"):
-                    repos.append(repo["full_name"])
-            if len(data) < 100:
-                break
+            response.raise_for_status()
+            batch = response.json()
+            repos.extend(
+                repo["full_name"] for repo in batch
+                if (repo.get("permissions") or {}).get("push")
+                or (repo.get("permissions") or {}).get("admin")
+            )
+            if len(batch) < 100:
+                return repos
             page += 1
-    return repos
 
 
-def _numbered_list(items: list[str]) -> str:
-    return "\n".join(f"{i+1}. `{item}`" for i, item in enumerate(items))
+def _numbered(items: list[str]) -> str:
+    return "\n".join(f"{index}. {item}" for index, item in enumerate(items, 1))
 
 
-# ── /start ────────────────────────────────────────────────────────────────────
+async def _active_repos(telegram_id: str) -> list[Repo]:
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(Repo).where(
+            Repo.telegram_id == telegram_id,
+            Repo.active.is_(True),
+        ).order_by(Repo.full_name))
+        return list(result.scalars())
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Welcome to the *GitHub PR Review Bot*!\n\n"
-        "I automatically review Pull Requests on your repos:\n"
-        "• ✅ PR fully solves the issue → I merge it\n"
-        "• ❌ PR is incomplete → I tag the contributor with exactly what to fix\n"
-        "• ⚠️ PR has no `Closes #issue` → I block it and explain why\n\n"
-        "To get started:\n"
-        "1. Run /setup to connect your GitHub account\n"
-        "2. Run /addrepo to pick a repo to monitor\n"
-        "3. That's it — I'll handle the rest!\n\n"
-        "Run /help to see all commands.",
-        parse_mode="Markdown",
+        "Welcome to the GitHub PR Review Bot.\n\n"
+        "I compare each PR with its linked issue, wait for CI, request precise changes "
+        "when needed, and merge the exact reviewed commit when it is complete.\n\n"
+        "Run /setup, then /addrepo. Existing open PRs are scanned when a repo is added."
     )
 
 
-# ── /help ─────────────────────────────────────────────────────────────────────
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "*Available Commands:*\n\n"
-        "/setup — Connect your GitHub account\n"
-        "/addrepo — Pick a repo from your GitHub to monitor\n"
-        "/scanrepo — Review existing open PRs (5 at a time)\n"
-        "/cleanrepo — Delete spam comments the bot previously posted\n"
-        "/listrepos — See your registered repos\n"
-        "/removerepo — Remove a repo from monitoring\n"
-        "/status — Check your account status\n"
-        "/help — Show this message\n\n"
-        "*How it works:*\n"
-        "After setup, I register a webhook on each repo you add. "
-        "When a PR is opened or updated, I review it automatically and notify you here.",
-        parse_mode="Markdown",
+        "/setup — connect GitHub\n"
+        "/addrepo — monitor a repository and scan existing PRs\n"
+        "/scanrepo — rescan all open PRs\n"
+        "/listrepos — show monitored repositories\n"
+        "/removerepo — stop monitoring a repository\n"
+        "/cleanrepo — remove old bot error comments\n"
+        "/status — show configuration and queued work\n"
+        "/cancel — cancel the current command"
     )
 
 
-# ── /setup ────────────────────────────────────────────────────────────────────
 async def setup_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🔑 *GitHub Token Setup*\n\n"
-        "I need a GitHub Personal Access Token (classic) with these permissions:\n"
-        "• `repo` — full repo access\n"
-        "• `write:repo_hook` — register webhooks\n\n"
-        "👉 Create one at: https://github.com/settings/tokens/new\n\n"
-        "Once you have it, paste it here.\n"
-        "Your token is *encrypted* before storage — only you can use it.\n\n"
-        "Type /cancel to abort.",
-        parse_mode="Markdown",
+        "Send a GitHub personal access token with repository contents, pull-request, "
+        "issues, checks/status, webhook administration, and merge access. "
+        "The message will be deleted immediately. Use /cancel to stop."
     )
     return WAITING_FOR_TOKEN
 
@@ -145,456 +106,228 @@ async def setup_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def receive_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
     token = update.message.text.strip()
     telegram_id = str(update.effective_user.id)
-
-    # Delete the message immediately for security
     try:
         await update.message.delete()
     except Exception:
         pass
-
-    await update.message.reply_text("⏳ Validating your token with GitHub...")
-    github_username = await gh.validate_token(token)
-    if not github_username:
-        await update.message.reply_text(
-            "❌ That token doesn't seem to be valid.\n"
-            "Make sure it's a *classic* token with `repo` + `write:repo_hook` permissions.\n"
-            "Try /setup again.",
-            parse_mode="Markdown",
-        )
+    username = await gh.validate_token(token)
+    if not username:
+        await update.effective_chat.send_message("That GitHub token is invalid. Run /setup to try again.")
         return ConversationHandler.END
-
-    encrypted = encrypt_token(token)
     async with AsyncSessionLocal() as db:
         result = await db.execute(select(User).where(User.telegram_id == telegram_id))
         user = result.scalar_one_or_none()
-        if user:
-            user.github_token_encrypted = encrypted
-            user.github_username = github_username
-            user.setup_complete = True
-        else:
-            user = User(
-                telegram_id=telegram_id,
-                github_token_encrypted=encrypted,
-                github_username=github_username,
-                setup_complete=True,
-            )
+        if not user:
+            user = User(telegram_id=telegram_id)
             db.add(user)
+        user.github_token_encrypted = encrypt_token(token)
+        user.github_username = username
+        user.setup_complete = True
         await db.commit()
-
-    await update.message.reply_text(
-        f"✅ Connected as *{github_username}*!\n\n"
-        "Now run /addrepo to pick a repo to monitor.",
-        parse_mode="Markdown",
-    )
+    await update.effective_chat.send_message(f"Connected as @{username}. Run /addrepo next.")
     return ConversationHandler.END
 
 
-# ── /addrepo ──────────────────────────────────────────────────────────────────
 async def addrepo_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     telegram_id = str(update.effective_user.id)
     user, token = await _get_user_and_token(telegram_id)
     if not user:
-        await update.message.reply_text("Please run /setup first to connect your GitHub account.")
+        await update.message.reply_text("Run /setup first.")
         return ConversationHandler.END
-
-    await update.message.reply_text("⏳ Fetching your GitHub repos...")
-
-    repos = await _fetch_github_repos(token)
-    if not repos:
-        await update.message.reply_text(
-            "❌ Couldn't find any repos with push access on your account.\n"
-            "Make sure your token has the `repo` permission."
-        )
+    await update.message.reply_text("Fetching repositories with push access...")
+    try:
+        github_repos = await _fetch_github_repos(token)
+    except Exception as exc:
+        logger.error("Could not fetch repositories: %s", exc)
+        await update.message.reply_text("GitHub could not return your repositories. Check the token permissions.")
         return ConversationHandler.END
-
-    # Filter out already-registered ones
     async with AsyncSessionLocal() as db:
-        result = await db.execute(
-            select(Repo).where(Repo.telegram_id == telegram_id, Repo.active == True)
-        )
-        already = {r.full_name for r in result.scalars().all()}
-
-    available = [r for r in repos if r not in already]
+        result = await db.execute(select(Repo).where(Repo.active.is_(True)))
+        monitored = {repo.full_name for repo in result.scalars()}
+    available = [repo for repo in github_repos if repo not in monitored]
     if not available:
-        await update.message.reply_text(
-            "All your repos are already being monitored!\n"
-            "Run /listrepos to see them."
-        )
+        await update.message.reply_text("No unmonitored repositories with push access were found.")
         return ConversationHandler.END
-
     context.user_data["addrepo_list"] = available
     await update.message.reply_text(
-        f"📦 *Pick a repo to monitor:*\n\n"
-        + _numbered_list(available)
-        + "\n\nReply with the number. Type /cancel to abort.",
-        parse_mode="Markdown",
+        "Choose a repository:\n\n" + _numbered(available) + "\n\nReply with its number."
     )
     return WAITING_FOR_REPO
 
 
 async def receive_repo_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     telegram_id = str(update.effective_user.id)
-    repos = context.user_data.get("addrepo_list", [])
+    choices = context.user_data.get("addrepo_list", [])
     text = update.message.text.strip()
-
-    if not text.isdigit() or int(text) < 1 or int(text) > len(repos):
-        await update.message.reply_text(
-            f"Please reply with a number between 1 and {len(repos)}."
-        )
+    if not text.isdigit() or not 1 <= int(text) <= len(choices):
+        await update.message.reply_text(f"Reply with a number from 1 to {len(choices)}.")
         return WAITING_FOR_REPO
-
-    repo_name = repos[int(text) - 1]
-    await update.message.reply_text(
-        f"⏳ Registering `{repo_name}`...", parse_mode="Markdown"
-    )
-
+    repo_name = choices[int(text) - 1]
     user, token = await _get_user_and_token(telegram_id)
-
-    public_url = os.getenv("PUBLIC_URL", "").rstrip("/")
-    webhook_url = f"{public_url}/webhook/github"
-    secret = os.getenv("GITHUB_WEBHOOK_SECRET", "default_secret")
-
-    try:
-        webhook_id = await gh.register_webhook(token, repo_name, webhook_url, secret)
-    except Exception as e:
-        await update.message.reply_text(
-            f"❌ Failed to register webhook: {str(e)}\n"
-            "Make sure your token has `write:repo_hook` permission.",
-            parse_mode="Markdown",
-        )
+    if not user:
         return ConversationHandler.END
-
-    async with AsyncSessionLocal() as db:
-        repo = Repo(
-            telegram_id=telegram_id,
-            full_name=repo_name,
-            webhook_id=webhook_id,
+    webhook_url = os.environ["PUBLIC_URL"].rstrip("/") + "/webhook/github"
+    try:
+        webhook_id = await gh.register_webhook(
+            token, repo_name, webhook_url, os.environ["GITHUB_WEBHOOK_SECRET"]
         )
-        db.add(repo)
+    except Exception as exc:
+        logger.error("Webhook registration failed for %s: %s", repo_name, exc)
+        await update.message.reply_text("Webhook registration failed. Check webhook-admin permission.")
+        return ConversationHandler.END
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(Repo).where(
+            Repo.telegram_id == telegram_id,
+            Repo.full_name == repo_name,
+        ))
+        repo = result.scalars().first()
+        if not repo:
+            repo = Repo(telegram_id=telegram_id, full_name=repo_name)
+            db.add(repo)
+        repo.webhook_id = webhook_id
+        repo.active = True
         await db.commit()
-
-    await update.message.reply_text(
-        f"✅ Now monitoring *{repo_name}*!\n\n"
-        "When a PR is opened:\n"
-        "• I check for `Closes #issue` in the description\n"
-        "• Review the diff against the issue using AI\n"
-        "• Merge if fully solved, or request changes if not\n"
-        "• Notify you here either way 🔔",
-        parse_mode="Markdown",
-    )
+    try:
+        count = await enqueue_all_open_prs(token, repo_name)
+        scan_message = f"Queued {count} existing open PR(s) for review."
+    except Exception as exc:
+        logger.error("Initial scan failed for %s: %s", repo_name, exc)
+        scan_message = "The initial scan failed; run /scanrepo to retry it."
+    await update.message.reply_text(f"Now monitoring {repo_name}. {scan_message}")
     return ConversationHandler.END
 
 
-# ── /listrepos ────────────────────────────────────────────────────────────────
 async def list_repos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    telegram_id = str(update.effective_user.id)
-    async with AsyncSessionLocal() as db:
-        result = await db.execute(
-            select(Repo).where(Repo.telegram_id == telegram_id, Repo.active == True)
-        )
-        repos = result.scalars().all()
-
-    if not repos:
-        await update.message.reply_text(
-            "You have no repos registered yet. Run /addrepo to add one."
-        )
-        return
-
-    lines = [f"• `{r.full_name}`" for r in repos]
+    repos = await _active_repos(str(update.effective_user.id))
     await update.message.reply_text(
-        f"*Your monitored repos ({len(repos)}):*\n\n" + "\n".join(lines),
-        parse_mode="Markdown",
+        "Monitored repositories:\n" + "\n".join(repo.full_name for repo in repos)
+        if repos else "No repositories are being monitored."
     )
 
 
-# ── /removerepo ───────────────────────────────────────────────────────────────
-async def removerepo_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    telegram_id = str(update.effective_user.id)
-    async with AsyncSessionLocal() as db:
-        result = await db.execute(
-            select(Repo).where(Repo.telegram_id == telegram_id, Repo.active == True)
-        )
-        repos = result.scalars().all()
-
+async def _choose_repo(update: Update, context, key: str, state: int, prompt: str):
+    repos = await _active_repos(str(update.effective_user.id))
     if not repos:
-        await update.message.reply_text("You have no repos to remove.")
+        await update.message.reply_text("No repositories are being monitored.")
         return ConversationHandler.END
+    context.user_data[key] = [repo.full_name for repo in repos]
+    await update.message.reply_text(prompt + "\n\n" + _numbered(context.user_data[key]))
+    return state
 
-    context.user_data["remove_repos"] = [r.full_name for r in repos]
-    await update.message.reply_text(
-        "*Which repo do you want to remove?*\n\n"
-        + _numbered_list([r.full_name for r in repos])
-        + "\n\nReply with the number. Type /cancel to abort.",
-        parse_mode="Markdown",
-    )
-    return WAITING_FOR_REMOVE_REPO
+
+async def removerepo_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await _choose_repo(update, context, "remove_repos", WAITING_FOR_REMOVE_REPO, "Choose a repository to remove:")
 
 
 async def receive_remove_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     telegram_id = str(update.effective_user.id)
-    repos = context.user_data.get("remove_repos", [])
+    choices = context.user_data.get("remove_repos", [])
     text = update.message.text.strip()
-
-    if not text.isdigit() or int(text) < 1 or int(text) > len(repos):
-        await update.message.reply_text(
-            f"Please reply with a number between 1 and {len(repos)}."
-        )
+    if not text.isdigit() or not 1 <= int(text) <= len(choices):
+        await update.message.reply_text(f"Reply with a number from 1 to {len(choices)}.")
         return WAITING_FOR_REMOVE_REPO
-
-    repo_name = repos[int(text) - 1]
-
+    repo_name = choices[int(text) - 1]
+    user, token = await _get_user_and_token(telegram_id)
     async with AsyncSessionLocal() as db:
-        result = await db.execute(
-            select(Repo).where(
-                Repo.telegram_id == telegram_id,
-                Repo.full_name == repo_name,
-                Repo.active == True,
-            )
-        )
-        repo = result.scalar_one_or_none()
-        if not repo:
-            await update.message.reply_text("❌ Repo not found.")
-            return ConversationHandler.END
-
-        user_result = await db.execute(select(User).where(User.telegram_id == telegram_id))
-        user = user_result.scalar_one_or_none()
-        if user and repo.webhook_id:
-            from app.services.crypto import decrypt_token
-            token = decrypt_token(user.github_token_encrypted)
+        result = await db.execute(select(Repo).where(
+            Repo.telegram_id == telegram_id, Repo.full_name == repo_name, Repo.active.is_(True)
+        ))
+        repo = result.scalars().first()
+        if repo and repo.webhook_id and token:
             try:
                 await gh.delete_webhook(token, repo_name, repo.webhook_id)
-            except Exception:
-                pass
-
-        repo.active = False
-        await db.commit()
-
-    await update.message.reply_text(
-        f"✅ Removed `{repo_name}`. I'll no longer monitor PRs on that repo.",
-        parse_mode="Markdown",
-    )
+            except Exception as exc:
+                logger.warning("Could not delete webhook for %s: %s", repo_name, exc)
+        if repo:
+            repo.active = False
+            await db.commit()
+    await update.message.reply_text(f"Stopped monitoring {repo_name}.")
     return ConversationHandler.END
 
 
-# ── /scanrepo ─────────────────────────────────────────────────────────────────
 async def scanrepo_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    telegram_id = str(update.effective_user.id)
-    async with AsyncSessionLocal() as db:
-        result = await db.execute(
-            select(Repo).where(Repo.telegram_id == telegram_id, Repo.active == True)
-        )
-        repos = result.scalars().all()
-
-    if not repos:
-        await update.message.reply_text(
-            "You have no repos registered yet. Run /addrepo to add one."
-        )
-        return ConversationHandler.END
-
-    context.user_data["scan_repos"] = [r.full_name for r in repos]
-    await update.message.reply_text(
-        "🔍 *Which repo do you want to scan?*\n\n"
-        + _numbered_list([r.full_name for r in repos])
-        + "\n\nReply with the number. Type /cancel to abort.",
-        parse_mode="Markdown",
-    )
-    return WAITING_FOR_SCAN_CHOICE
+    return await _choose_repo(update, context, "scan_repos", WAITING_FOR_SCAN_CHOICE, "Choose a repository to scan:")
 
 
 async def receive_scan_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    telegram_id = str(update.effective_user.id)
-    repos = context.user_data.get("scan_repos", [])
+    choices = context.user_data.get("scan_repos", [])
     text = update.message.text.strip()
-
-    if not text.isdigit() or int(text) < 1 or int(text) > len(repos):
-        await update.message.reply_text(
-            f"Please reply with a number between 1 and {len(repos)}."
-        )
+    if not text.isdigit() or not 1 <= int(text) <= len(choices):
+        await update.message.reply_text(f"Reply with a number from 1 to {len(choices)}.")
         return WAITING_FOR_SCAN_CHOICE
-
-    repo_name = repos[int(text) - 1]
-    page = context.user_data.get("scan_page", 1)
-
-    await update.message.reply_text(
-        f"Scanning {repo_name} — batch {page} (up to 5 PRs)..."
-    )
-
-    user, token = await _get_user_and_token(telegram_id)
+    repo_name = choices[int(text) - 1]
+    user, token = await _get_user_and_token(str(update.effective_user.id))
     if not user:
-        await update.message.reply_text("Please run /setup first.")
         return ConversationHandler.END
-
-    async with AsyncSessionLocal() as db:
-        from app.services.pr_reviewer import scan_all_open_prs
-        results = await scan_all_open_prs(
-            token=token,
-            telegram_id=telegram_id,
-            repo_full_name=repo_name,
-            db=db,
-            page=page,
-            limit=5,
-        )
-
-    if not results:
-        msg = "No open PRs found." if page == 1 else "No more PRs in this batch."
-        await update.message.reply_text(msg)
-        context.user_data.pop("scan_page", None)
-        return ConversationHandler.END
-
-    labels = {
-        "MERGED":       "Merged",
-        "COMMENTED":    "Needs changes — contributor tagged",
-        "SKIPPED":      "Skipped — no Closes #issue",
-        "RATE_LIMITED": "AI limit hit — PR notified",
-        "ERROR":        "Error — manual review needed",
-    }
-
-    lines = []
-    for r in results:
-        label = labels.get(r["outcome"], r["outcome"])
-        lines.append(f"PR #{r['pr_number']} — {r['pr_title'][:40]}\n   {label}")
-
-    context.user_data["scan_page"] = page + 1
-
-    rate_limited = any(r["outcome"] == "RATE_LIMITED" for r in results)
-    footer = (
-        "\n\nAI quota exhausted. Try /scanrepo again tomorrow to continue."
-        if rate_limited
-        else f"\n\nRun /scanrepo again to scan the next 5 PRs (batch {page + 1})."
-    )
-
-    await update.message.reply_text(
-        f"Scan complete — {repo_name} (batch {page})\n"
-        f"{len(results)} PR(s) reviewed\n\n"
-        + "\n\n".join(lines)
-        + footer,
-    )
+    await update.message.reply_text("Queuing all existing open PRs...")
+    count = await enqueue_all_open_prs(token, repo_name)
+    await update.message.reply_text(f"Queued {count} open PR(s). Results will arrive as reviews complete.")
     return ConversationHandler.END
 
 
-# ── /cleanrepo ────────────────────────────────────────────────────────────────
 async def cleanrepo_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    telegram_id = str(update.effective_user.id)
-    async with AsyncSessionLocal() as db:
-        result = await db.execute(
-            select(Repo).where(Repo.telegram_id == telegram_id, Repo.active == True)
-        )
-        repos = result.scalars().all()
-
-    if not repos:
-        await update.message.reply_text("You have no repos registered yet.")
-        return ConversationHandler.END
-
-    context.user_data["clean_repos"] = [r.full_name for r in repos]
-    await update.message.reply_text(
-        "Which repo do you want to clean spam comments from?\n\n"
-        + _numbered_list([r.full_name for r in repos])
-        + "\n\nReply with the number. Type /cancel to abort.",
-    )
-    return WAITING_FOR_CLEAN_CHOICE
+    return await _choose_repo(update, context, "clean_repos", WAITING_FOR_CLEAN_CHOICE, "Choose a repository to clean:")
 
 
 async def receive_clean_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    telegram_id = str(update.effective_user.id)
-    repos = context.user_data.get("clean_repos", [])
+    choices = context.user_data.get("clean_repos", [])
     text = update.message.text.strip()
-
-    if not text.isdigit() or int(text) < 1 or int(text) > len(repos):
-        await update.message.reply_text(
-            f"Please reply with a number between 1 and {len(repos)}."
-        )
+    if not text.isdigit() or not 1 <= int(text) <= len(choices):
+        await update.message.reply_text(f"Reply with a number from 1 to {len(choices)}.")
         return WAITING_FOR_CLEAN_CHOICE
-
-    repo_name = repos[int(text) - 1]
-    await update.message.reply_text(f"Cleaning spam comments on {repo_name}...")
-
-    user, token = await _get_user_and_token(telegram_id)
+    repo_name = choices[int(text) - 1]
+    user, token = await _get_user_and_token(str(update.effective_user.id))
     if not user:
-        await update.message.reply_text("Please run /setup first.")
         return ConversationHandler.END
-
     from app.services.pr_reviewer import cleanup_spam_comments
-    deleted = await cleanup_spam_comments(token, telegram_id, repo_name)
-
-    await update.message.reply_text(
-        f"Done. Deleted {deleted} spam comment(s) from {repo_name}."
-    )
+    count = await cleanup_spam_comments(token, user.telegram_id, repo_name)
+    await update.message.reply_text(f"Deleted {count} old bot error comment(s).")
     return ConversationHandler.END
 
 
-# ── /status ───────────────────────────────────────────────────────────────────
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     telegram_id = str(update.effective_user.id)
+    user, _ = await _get_user_and_token(telegram_id)
+    repos = await _active_repos(telegram_id)
     async with AsyncSessionLocal() as db:
-        user_result = await db.execute(select(User).where(User.telegram_id == telegram_id))
-        user = user_result.scalar_one_or_none()
-        repo_result = await db.execute(
-            select(Repo).where(Repo.telegram_id == telegram_id, Repo.active == True)
+        result = await db.execute(select(func.count()).select_from(ReviewJob).where(
+            ReviewJob.repo_full_name.in_([repo.full_name for repo in repos]),
+            ReviewJob.status.in_(["QUEUED", "PROCESSING"]),
+        )) if repos else None
+        queued = result.scalar_one() if result else 0
+    if not user:
+        await update.message.reply_text("Not configured. Run /setup.")
+    else:
+        await update.message.reply_text(
+            f"GitHub: @{user.github_username}\nMonitored repositories: {len(repos)}\nQueued reviews: {queued}"
         )
-        repos = repo_result.scalars().all()
-
-    if not user or not user.setup_complete:
-        await update.message.reply_text("❌ Not set up yet. Run /setup to connect your GitHub.")
-        return
-
-    await update.message.reply_text(
-        f"*Your Bot Status*\n\n"
-        f"GitHub: *@{user.github_username}* ✅\n"
-        f"Monitored repos: *{len(repos)}*\n\n"
-        + ("\n".join([f"• `{r.full_name}`" for r in repos]) if repos else "_No repos yet_"),
-        parse_mode="Markdown",
-    )
 
 
-# ── /cancel ───────────────────────────────────────────────────────────────────
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Cancelled. Run /help to see available commands.")
+    await update.message.reply_text("Cancelled.")
     return ConversationHandler.END
 
 
-# ── app builder ───────────────────────────────────────────────────────────────
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.exception("Telegram handler failed", exc_info=context.error)
+    if isinstance(update, Update) and update.effective_chat:
+        await update.effective_chat.send_message("That operation failed. Please try again shortly.")
+
+
 def build_telegram_app() -> Application:
-    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
-    if not bot_token:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set.")
-
-    app = Application.builder().token(bot_token).build()
-
-    setup_conv = ConversationHandler(
-        entry_points=[CommandHandler("setup", setup_start)],
-        states={WAITING_FOR_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_token)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-    addrepo_conv = ConversationHandler(
-        entry_points=[CommandHandler("addrepo", addrepo_start)],
-        states={WAITING_FOR_REPO: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_repo_choice)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-    removerepo_conv = ConversationHandler(
-        entry_points=[CommandHandler("removerepo", removerepo_start)],
-        states={WAITING_FOR_REMOVE_REPO: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_remove_choice)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-    scanrepo_conv = ConversationHandler(
-        entry_points=[CommandHandler("scanrepo", scanrepo_start)],
-        states={WAITING_FOR_SCAN_CHOICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_scan_choice)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-
-    cleanrepo_conv = ConversationHandler(
-        entry_points=[CommandHandler("cleanrepo", cleanrepo_start)],
-        states={WAITING_FOR_CLEAN_CHOICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_clean_choice)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-
+    app = Application.builder().token(os.environ["TELEGRAM_BOT_TOKEN"]).build()
+    conversations = [
+        ConversationHandler([CommandHandler("setup", setup_start)], {WAITING_FOR_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_token)]}, [CommandHandler("cancel", cancel)]),
+        ConversationHandler([CommandHandler("addrepo", addrepo_start)], {WAITING_FOR_REPO: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_repo_choice)]}, [CommandHandler("cancel", cancel)]),
+        ConversationHandler([CommandHandler("removerepo", removerepo_start)], {WAITING_FOR_REMOVE_REPO: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_remove_choice)]}, [CommandHandler("cancel", cancel)]),
+        ConversationHandler([CommandHandler("scanrepo", scanrepo_start)], {WAITING_FOR_SCAN_CHOICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_scan_choice)]}, [CommandHandler("cancel", cancel)]),
+        ConversationHandler([CommandHandler("cleanrepo", cleanrepo_start)], {WAITING_FOR_CLEAN_CHOICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_clean_choice)]}, [CommandHandler("cancel", cancel)]),
+    ]
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("listrepos", list_repos))
     app.add_handler(CommandHandler("status", status))
-    app.add_handler(setup_conv)
-    app.add_handler(addrepo_conv)
-    app.add_handler(removerepo_conv)
-    app.add_handler(scanrepo_conv)
-    app.add_handler(cleanrepo_conv)
-
+    for conversation in conversations:
+        app.add_handler(conversation)
+    app.add_error_handler(error_handler)
     return app
