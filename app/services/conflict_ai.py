@@ -1,4 +1,5 @@
 """AI-assisted resolution of explicit Git conflict blocks."""
+import asyncio
 import json
 import logging
 import os
@@ -6,7 +7,6 @@ import os
 import httpx
 
 from app.services.ai_review import (
-    DEEPSEEK_URL,
     GEMINI_URL,
     AIReviewError,
     _apply_gemini_rate_limit_cooldown,
@@ -15,6 +15,7 @@ from app.services.ai_review import (
 )
 
 logger = logging.getLogger(__name__)
+DEEPSEEK_BETA_URL = "https://api.deepseek.com/beta/chat/completions"
 
 
 class ConflictResolutionError(Exception):
@@ -33,12 +34,20 @@ async def resolve_conflict_blocks(
         raise ConflictResolutionError("No conflict blocks were supplied")
     prompt = _build_prompt(issue_title, issue_body, pr_title, pr_body, blocks)
     deepseek_error = None
-    try:
-        raw = await _deepseek_resolution(prompt)
-        return _validate_resolutions(raw, len(blocks))
-    except (AIReviewError, ConflictResolutionError) as exc:
-        deepseek_error = exc
-        logger.warning("DeepSeek conflict resolution failed; trying Gemini: %s", exc)
+    retries = max(0, int(os.getenv("AI_CONFLICT_PROVIDER_RETRIES", "2")))
+    for attempt in range(retries + 1):
+        try:
+            raw = await _deepseek_resolution(prompt, len(blocks))
+            return _validate_resolutions(raw, len(blocks))
+        except (AIReviewError, ConflictResolutionError) as exc:
+            deepseek_error = exc
+            if attempt < retries:
+                logger.warning(
+                    "DeepSeek conflict output attempt %s was invalid; retrying: %s",
+                    attempt + 1, exc,
+                )
+                await asyncio.sleep(2 ** attempt)
+    logger.warning("DeepSeek conflict resolution failed; trying Gemini: %s", deepseek_error)
 
     try:
         raw = await _gemini_resolution(prompt)
@@ -103,7 +112,7 @@ the source text for that conflict block, without Markdown fences.
 """
 
 
-async def _deepseek_resolution(prompt: str) -> object:
+async def _deepseek_resolution(prompt: str, expected_count: int) -> object:
     api_key = os.getenv("DEEPSEEK_API_KEY")
     if not api_key:
         raise AIReviewError("DEEPSEEK_API_KEY is not set")
@@ -112,27 +121,63 @@ async def _deepseek_resolution(prompt: str) -> object:
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.1,
         "max_tokens": int(os.getenv("AI_CONFLICT_MAX_OUTPUT_TOKENS", "8192")),
-        "response_format": {"type": "json_object"},
         "thinking": {"type": "disabled"},
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "submit_conflict_resolutions",
+                "description": "Submit the complete source replacement for every conflict.",
+                "strict": True,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "resolutions": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "index": {
+                                        "type": "integer",
+                                        "minimum": 1,
+                                        "maximum": expected_count,
+                                    },
+                                    "replacement": {"type": "string"},
+                                },
+                                "required": ["index", "replacement"],
+                                "additionalProperties": False,
+                            },
+                        }
+                    },
+                    "required": ["resolutions"],
+                    "additionalProperties": False,
+                },
+            },
+        }],
+        "tool_choice": {
+            "type": "function",
+            "function": {"name": "submit_conflict_resolutions"},
+        },
     }
     try:
-        await _wait_for_gemini_slot()
         async with httpx.AsyncClient(timeout=120) as client:
             response = await client.post(
-                DEEPSEEK_URL,
+                DEEPSEEK_BETA_URL,
                 headers={"Authorization": f"Bearer {api_key}"},
                 json=payload,
             )
-        if response.status_code == 429:
-            await _apply_gemini_rate_limit_cooldown(response)
         response.raise_for_status()
         choice = response.json()["choices"][0]
-        if choice.get("finish_reason") != "stop":
+        if choice.get("finish_reason") != "tool_calls":
             raise AIReviewError(
                 f"DeepSeek conflict response ended with {choice.get('finish_reason')}"
             )
-        return _decode_json(choice["message"]["content"])
-    except (httpx.HTTPError, json.JSONDecodeError, KeyError, IndexError) as exc:
+        tool_calls = choice["message"]["tool_calls"]
+        call = next(
+            item for item in tool_calls
+            if item.get("function", {}).get("name") == "submit_conflict_resolutions"
+        )
+        return json.loads(call["function"]["arguments"])
+    except (httpx.HTTPError, json.JSONDecodeError, KeyError, IndexError, StopIteration) as exc:
         raise AIReviewError(f"DeepSeek conflict request failed: {exc}") from exc
 
 
@@ -166,12 +211,15 @@ async def _gemini_resolution(prompt: str) -> object:
         },
     }
     try:
+        await _wait_for_gemini_slot()
         async with httpx.AsyncClient(timeout=120) as client:
             response = await client.post(
                 GEMINI_URL,
                 headers={"x-goog-api-key": api_key},
                 json=payload,
             )
+        if response.status_code == 429:
+            await _apply_gemini_rate_limit_cooldown(response)
         response.raise_for_status()
         candidate = response.json()["candidates"][0]
         if candidate.get("finishReason") != "STOP":
