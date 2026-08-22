@@ -296,6 +296,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user, _ = await _get_user_and_token(telegram_id)
     repos = await _active_repos(telegram_id)
     counts = {"QUEUED": 0, "PROCESSING": 0, "DONE": 0, "FAILED": 0}
+    wait_counts = {"RATE_LIMITED": 0, "WAITING_CI": 0}
     async with AsyncSessionLocal() as db:
         if repos:
             result = await db.execute(
@@ -304,6 +305,16 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 .group_by(ReviewJob.status)
             )
             counts.update(dict(result.all()))
+            wait_result = await db.execute(
+                select(ReviewJob.last_error, func.count())
+                .where(
+                    ReviewJob.repo_full_name.in_([repo.full_name for repo in repos]),
+                    ReviewJob.status == "QUEUED",
+                    ReviewJob.last_error.in_(["RATE_LIMITED", "WAITING_CI"]),
+                )
+                .group_by(ReviewJob.last_error)
+            )
+            wait_counts.update(dict(wait_result.all()))
     if not user:
         await update.message.reply_text("Not configured. Run /setup.")
     else:
@@ -311,6 +322,8 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"GitHub: @{user.github_username}\n"
             f"Monitored repositories: {len(repos)}\n"
             f"Queued: {counts['QUEUED']}\n"
+            f"  Waiting for AI quota: {wait_counts['RATE_LIMITED']}\n"
+            f"  Waiting for CI: {wait_counts['WAITING_CI']}\n"
             f"Processing: {counts['PROCESSING']}\n"
             f"Completed: {counts['DONE']}\n"
             f"Failed: {counts['FAILED']}"
