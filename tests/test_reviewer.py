@@ -28,7 +28,7 @@ async def test_dirty_approved_pr_is_repaired(monkeypatch):
         return "a" * 40
 
     monkeypatch.setattr(pr_reviewer.gh, "get_pr_merge_state", dirty)
-    monkeypatch.setattr(pr_reviewer, "_repair_attempt_count", no_repairs)
+    monkeypatch.setattr(pr_reviewer, "_repair_count", no_repairs)
     monkeypatch.setattr(pr_reviewer, "repair_pull_request_conflicts", repair)
 
     decision, summary = await pr_reviewer._repair_conflict_if_safe(
@@ -78,7 +78,7 @@ async def test_conflict_repair_stops_after_configured_limit(monkeypatch):
         return 2
 
     monkeypatch.setattr(pr_reviewer.gh, "get_pr_merge_state", dirty)
-    monkeypatch.setattr(pr_reviewer, "_repair_attempt_count", two_repairs)
+    monkeypatch.setattr(pr_reviewer, "_repair_count", two_repairs)
     monkeypatch.setenv("AUTO_RESOLVE_MAX_ATTEMPTS", "2")
 
     decision, summary = await pr_reviewer._repair_conflict_if_safe(

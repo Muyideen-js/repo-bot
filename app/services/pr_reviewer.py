@@ -5,7 +5,7 @@ import re
 from datetime import datetime, timezone
 
 import httpx
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.database import PRLog
@@ -157,7 +157,7 @@ async def _repair_conflict_if_safe(
         return "MERGE_BLOCKED", current_summary
 
     max_repairs = max(1, int(os.getenv("AUTO_RESOLVE_MAX_ATTEMPTS", "2")))
-    repair_count = await _repair_attempt_count(db, repo_full_name, pr_number)
+    repair_count = await _repair_count(db, repo_full_name, pr_number)
     if repair_count >= max_repairs:
         return (
             "MERGE_BLOCKED",
@@ -197,18 +197,6 @@ async def _repair_count(db: AsyncSession, repo: str, pr_number: int) -> int:
     return int(result.scalar_one())
 
 
-async def _repair_attempt_count(db: AsyncSession, repo: str, pr_number: int) -> int:
-    result = await db.execute(
-        select(func.count(PRLog.id)).where(
-            PRLog.repo_full_name == repo,
-            PRLog.pr_number == pr_number,
-            or_(
-                PRLog.decision == "CONFLICT_REPAIRED",
-                PRLog.reason.like("Automatic conflict repair failed safely:%"),
-            ),
-        )
-    )
-    return int(result.scalar_one())
 
 
 def _recently_updated(pr: dict, grace_seconds: int = 120) -> bool:
