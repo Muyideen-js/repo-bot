@@ -75,3 +75,65 @@ async def test_gemini_key_is_sent_in_header_not_url(monkeypatch):
     assert result["approved"] is False
     assert "secret-key" not in client.url
     assert client.headers["x-goog-api-key"] == "secret-key"
+
+
+@pytest.mark.asyncio
+async def test_deepseek_is_primary(monkeypatch):
+    expected = {
+        "approved": False,
+        "summary": "DeepSeek result",
+        "missing": ["Add tests"],
+        "comment": "@author Add tests.",
+    }
+
+    async def fake_deepseek(prompt, retries):
+        return expected.copy()
+
+    async def unexpected_gemini(prompt, retries):
+        pytest.fail("Gemini must not run when DeepSeek succeeds")
+
+    monkeypatch.setattr(ai_review, "_review_with_deepseek", fake_deepseek)
+    monkeypatch.setattr(ai_review, "_review_with_gemini", unexpected_gemini)
+
+    result = await ai_review.review_pr(
+        "Issue", "Body", "PR", "Body", "diff", "success", "author"
+    )
+    assert result["provider"] == "deepseek"
+    assert result["summary"] == "DeepSeek result"
+
+
+@pytest.mark.asyncio
+async def test_gemini_fallback_after_deepseek_failure(monkeypatch):
+    async def failed_deepseek(prompt, retries):
+        raise AIReviewError("DeepSeek unavailable")
+
+    async def successful_gemini(prompt, retries):
+        return {
+            "approved": False,
+            "summary": "Gemini fallback result",
+            "missing": ["Fix bug"],
+            "comment": "@author Fix the bug.",
+        }
+
+    monkeypatch.setattr(ai_review, "_review_with_deepseek", failed_deepseek)
+    monkeypatch.setattr(ai_review, "_review_with_gemini", successful_gemini)
+
+    result = await ai_review.review_pr(
+        "Issue", "Body", "PR", "Body", "diff", "success", "author"
+    )
+    assert result["provider"] == "gemini"
+    assert result["summary"] == "Gemini fallback result"
+
+
+@pytest.mark.asyncio
+async def test_both_provider_rate_limits_preserve_queue_cooldown(monkeypatch):
+    async def rate_limited(prompt, retries):
+        raise ai_review._ProviderRateLimitError("quota")
+
+    monkeypatch.setattr(ai_review, "_review_with_deepseek", rate_limited)
+    monkeypatch.setattr(ai_review, "_review_with_gemini", rate_limited)
+
+    with pytest.raises(ai_review.AIRateLimitError):
+        await ai_review.review_pr(
+            "Issue", "Body", "PR", "Body", "diff", "success", "author"
+        )
