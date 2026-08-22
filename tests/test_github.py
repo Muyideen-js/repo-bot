@@ -7,9 +7,10 @@ from app.services import github
 
 
 class FakeResponse:
-    def __init__(self, data, status_code=200):
+    def __init__(self, data, status_code=200, text=""):
         self._data = data
         self.status_code = status_code
+        self.text = text
 
     def json(self):
         return self._data
@@ -64,6 +65,24 @@ async def test_merge_is_pinned_to_reviewed_sha(monkeypatch):
     monkeypatch.setattr(github.httpx, "AsyncClient", lambda **kwargs: client)
     assert await github.merge_pr("token", "owner/repo", 7, "Title", "reviewed-sha")
     assert client.last_json["sha"] == "reviewed-sha"
+
+
+@pytest.mark.asyncio
+async def test_diff_406_falls_back_to_files_api(monkeypatch):
+    client = FakeClient([
+        FakeResponse({}, 406),
+        FakeResponse([{
+            "filename": "contract/src/lib.rs",
+            "status": "modified",
+            "additions": 2,
+            "deletions": 1,
+            "patch": "@@ -1 +1 @@\n-old\n+new",
+        }]),
+    ])
+    monkeypatch.setattr(github.httpx, "AsyncClient", lambda **kwargs: client)
+    diff = await github.get_pr_diff("token", "owner/repo", 147)
+    assert "contract/src/lib.rs" in diff
+    assert "+new" in diff
 
 
 def test_webhook_verification_fails_closed(monkeypatch):

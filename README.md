@@ -25,7 +25,7 @@ and merges the exact reviewed commit when the change is complete.
 
 - `/setup` — connect or rotate the GitHub token
 - `/addrepo` — monitor a repository and scan all existing PRs
-- `/scanrepo` — requeue all open PRs for a fresh review
+- `/scanrepo` — discover all open PRs and retry only new or failed commits
 - `/listrepos` — list monitored repositories
 - `/removerepo` — remove the webhook and stop monitoring
 - `/status` — show monitored repositories and queued work

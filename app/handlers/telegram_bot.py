@@ -188,8 +188,11 @@ async def receive_repo_choice(update: Update, context: ContextTypes.DEFAULT_TYPE
         repo.active = True
         await db.commit()
     try:
-        count = await enqueue_all_open_prs(token, repo_name)
-        scan_message = f"Queued {count} existing open PR(s) for review."
+        discovered, scheduled = await enqueue_all_open_prs(token, repo_name)
+        scan_message = (
+            f"Found {discovered} existing open PR(s); scheduled {scheduled} "
+            "new review(s)."
+        )
     except Exception as exc:
         logger.error("Initial scan failed for %s: %s", repo_name, exc)
         scan_message = "The initial scan failed; run /scanrepo to retry it."
@@ -260,8 +263,11 @@ async def receive_scan_choice(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not user:
         return ConversationHandler.END
     await update.message.reply_text("Queuing all existing open PRs...")
-    count = await enqueue_all_open_prs(token, repo_name)
-    await update.message.reply_text(f"Queued {count} open PR(s). Results will arrive as reviews complete.")
+    discovered, scheduled = await enqueue_all_open_prs(token, repo_name)
+    await update.message.reply_text(
+        f"Found {discovered} open PR(s); scheduled {scheduled} new or failed review(s). "
+        "Already completed commits were not duplicated."
+    )
     return ConversationHandler.END
 
 
@@ -289,17 +295,25 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     telegram_id = str(update.effective_user.id)
     user, _ = await _get_user_and_token(telegram_id)
     repos = await _active_repos(telegram_id)
+    counts = {"QUEUED": 0, "PROCESSING": 0, "DONE": 0, "FAILED": 0}
     async with AsyncSessionLocal() as db:
-        result = await db.execute(select(func.count()).select_from(ReviewJob).where(
-            ReviewJob.repo_full_name.in_([repo.full_name for repo in repos]),
-            ReviewJob.status.in_(["QUEUED", "PROCESSING"]),
-        )) if repos else None
-        queued = result.scalar_one() if result else 0
+        if repos:
+            result = await db.execute(
+                select(ReviewJob.status, func.count())
+                .where(ReviewJob.repo_full_name.in_([repo.full_name for repo in repos]))
+                .group_by(ReviewJob.status)
+            )
+            counts.update(dict(result.all()))
     if not user:
         await update.message.reply_text("Not configured. Run /setup.")
     else:
         await update.message.reply_text(
-            f"GitHub: @{user.github_username}\nMonitored repositories: {len(repos)}\nQueued reviews: {queued}"
+            f"GitHub: @{user.github_username}\n"
+            f"Monitored repositories: {len(repos)}\n"
+            f"Queued: {counts['QUEUED']}\n"
+            f"Processing: {counts['PROCESSING']}\n"
+            f"Completed: {counts['DONE']}\n"
+            f"Failed: {counts['FAILED']}"
         )
 
 

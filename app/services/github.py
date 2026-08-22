@@ -6,10 +6,12 @@ import hmac
 import hashlib
 import os
 import httpx
+import logging
 from typing import Optional
 
 
 GITHUB_API = "https://api.github.com"
+logger = logging.getLogger(__name__)
 CLOSES_PATTERN = re.compile(
     r"(?:closes|fixes|resolves)\s+#(\d+)",
     re.IGNORECASE,
@@ -46,24 +48,58 @@ async def get_pr(token: str, repo: str, pr_number: int) -> dict:
 
 
 async def get_pr_diff(token: str, repo: str, pr_number: int) -> str:
-    """Fetch the raw unified diff of the PR."""
+    """Fetch a PR diff, falling back to the files API for oversized diffs."""
     async with httpx.AsyncClient() as client:
         r = await client.get(
             f"{GITHUB_API}/repos/{repo}/pulls/{pr_number}",
             headers={**_headers(token), "Accept": "application/vnd.github.diff"},
         )
-        r.raise_for_status()
-        return r.text
+        if r.status_code == 200:
+            return r.text
+        if r.status_code not in (406, 422):
+            r.raise_for_status()
+
+    logger.warning(
+        "Raw diff unavailable for %s#%s (HTTP %s); using files API fallback",
+        repo, pr_number, r.status_code,
+    )
+    files = await get_pr_files(token, repo, pr_number)
+    sections = []
+    for file in files:
+        filename = file.get("filename", "unknown")
+        previous = file.get("previous_filename")
+        header = [
+            f"diff --git a/{previous or filename} b/{filename}",
+            f"status: {file.get('status', 'modified')}",
+            f"changes: +{file.get('additions', 0)} -{file.get('deletions', 0)}",
+        ]
+        patch = file.get("patch")
+        if patch:
+            header.append(patch)
+        else:
+            header.append("[Patch unavailable: binary or too large for GitHub's files API]")
+        sections.append("\n".join(header))
+    if not sections:
+        raise RuntimeError(f"GitHub returned no changed files for {repo}#{pr_number}")
+    return "\n\n".join(sections)
 
 
 async def get_pr_files(token: str, repo: str, pr_number: int) -> list:
+    files = []
     async with httpx.AsyncClient() as client:
-        r = await client.get(
-            f"{GITHUB_API}/repos/{repo}/pulls/{pr_number}/files",
-            headers=_headers(token),
-        )
-        r.raise_for_status()
-        return r.json()
+        page = 1
+        while True:
+            r = await client.get(
+                f"{GITHUB_API}/repos/{repo}/pulls/{pr_number}/files",
+                headers=_headers(token),
+                params={"per_page": 100, "page": page},
+            )
+            r.raise_for_status()
+            batch = r.json()
+            files.extend(batch)
+            if len(batch) < 100:
+                return files
+            page += 1
 
 
 async def get_issue(token: str, repo: str, issue_number: int) -> dict:
