@@ -75,6 +75,7 @@ Return only this JSON object:
   "comment": "professional GitHub review comment"
 }}
 
+Keep the summary under 200 characters and the comment under 1,200 characters.
 When not approved, the comment must tag @{contributor} and give precise,
 actionable corrections. When approved, clearly explain why the issue is solved.
 """
@@ -82,7 +83,7 @@ actionable corrections. When approved, clearly explain why the issue is solved.
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
             "temperature": 0.2,
-            "maxOutputTokens": 1536,
+            "maxOutputTokens": 4096,
             "responseMimeType": "application/json",
             "responseSchema": {
                 "type": "OBJECT",
@@ -101,7 +102,11 @@ actionable corrections. When approved, clearly explain why the issue is solved.
     for attempt in range(retries + 1):
         try:
             async with httpx.AsyncClient(timeout=45) as client:
-                response = await client.post(f"{GEMINI_URL}?key={api_key}", json=payload)
+                response = await client.post(
+                    GEMINI_URL,
+                    headers={"x-goog-api-key": api_key},
+                    json=payload,
+                )
             if response.status_code == 429:
                 raise AIRateLimitError("Gemini quota exceeded")
             if response.status_code == 400:
@@ -110,7 +115,17 @@ actionable corrections. When approved, clearly explain why the issue is solved.
                     raise AIRateLimitError("Gemini quota exceeded")
             response.raise_for_status()
             data = response.json()
-            raw_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            candidate = data["candidates"][0]
+            if candidate.get("finishReason") == "MAX_TOKENS":
+                raise AIReviewError("Gemini response was truncated at the output limit")
+            raw_text = (
+                candidate["content"]["parts"][0]["text"]
+                .strip()
+                .removeprefix("```json")
+                .removeprefix("```")
+                .removesuffix("```")
+                .strip()
+            )
             result = _validate_result(json.loads(raw_text))
             logger.info(
                 "Gemini decision approved=%s summary=%s",

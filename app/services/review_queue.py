@@ -37,14 +37,15 @@ async def enqueue_pr(repo_full_name: str, pr: dict, force: bool = False) -> bool
         ))
         job = result.scalar_one_or_none()
         if job:
-            if force or job.status in ("QUEUED", "FAILED"):
+            should_schedule = force or job.status == "FAILED"
+            if should_schedule or job.status == "QUEUED":
                 job.status = "QUEUED"
-                if force or job.status == "FAILED":
+                if should_schedule:
                     job.attempts = 0
                 job.next_attempt_at = datetime.utcnow()
                 job.last_error = None
                 await db.commit()
-            return False
+            return should_schedule
         db.add(ReviewJob(repo_full_name=repo_full_name, pr_number=number, head_sha=sha))
         try:
             await db.commit()
@@ -54,11 +55,13 @@ async def enqueue_pr(repo_full_name: str, pr: dict, force: bool = False) -> bool
             return False
 
 
-async def enqueue_all_open_prs(token: str, repo_full_name: str) -> int:
+async def enqueue_all_open_prs(token: str, repo_full_name: str) -> tuple[int, int]:
+    """Return (open PRs discovered, commits newly scheduled or retried)."""
     pull_requests = await gh.get_all_open_prs(token, repo_full_name)
+    scheduled = 0
     for pr in pull_requests:
-        await enqueue_pr(repo_full_name, pr, force=True)
-    return len(pull_requests)
+        scheduled += int(await enqueue_pr(repo_full_name, pr))
+    return len(pull_requests), scheduled
 
 
 async def wake_jobs_for_sha(repo_full_name: str, sha: str) -> None:
@@ -112,6 +115,10 @@ async def _process_job(job_id: int) -> None:
         job = await db.get(ReviewJob, job_id)
         if not job:
             return
+        logger.info(
+            "Review job started id=%s repo=%s pr=%s sha=%s attempt=%s",
+            job.id, job.repo_full_name, job.pr_number, job.head_sha[:12], job.attempts + 1,
+        )
         repo_result = await db.execute(select(Repo).where(
             Repo.full_name == job.repo_full_name,
             Repo.active.is_(True),
@@ -144,6 +151,10 @@ async def _process_job(job_id: int) -> None:
                 await enqueue_pr(job.repo_full_name, current)
             else:
                 await _finish(job, db, "DONE", outcome)
+            logger.info(
+                "Review job finished id=%s repo=%s pr=%s outcome=%s status=%s",
+                job.id, job.repo_full_name, job.pr_number, outcome, job.status,
+            )
         except Exception as exc:
             logger.exception("Review job %s failed", job.id)
             await _retry_or_fail(job, db, str(exc))

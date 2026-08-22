@@ -36,7 +36,7 @@ async def github_webhook(request: Request):
     elif event_type in {"check_run", "check_suite"}:
         container = payload.get(event_type) or {}
         for pr in container.get("pull_requests") or []:
-            queued += int(await enqueue_pr(repo_full_name, pr, force=True))
+            queued += int(await enqueue_pr(repo_full_name, pr))
     elif event_type == "status" and payload.get("sha"):
         await wake_jobs_for_sha(repo_full_name, payload["sha"])
 

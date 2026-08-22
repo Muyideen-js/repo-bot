@@ -22,6 +22,10 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+# HTTP client request URLs can contain credentials (notably Telegram bot tokens).
+# Keep application lifecycle/job logs while suppressing dependency request lines.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # Global Telegram app instance
