@@ -265,7 +265,8 @@ async def receive_scan_choice(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text("Queuing all existing open PRs...")
     discovered, scheduled = await enqueue_all_open_prs(token, repo_name)
     await update.message.reply_text(
-        f"Found {discovered} open PR(s); scheduled {scheduled} new or failed review(s). "
+        f"Found {discovered} open PR(s); scheduled {scheduled} new, failed, or "
+        "merge-blocked review(s). "
         "Already completed commits were not duplicated."
     )
     return ConversationHandler.END

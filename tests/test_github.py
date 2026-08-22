@@ -105,3 +105,21 @@ def test_webhook_signature(monkeypatch):
 ])
 def test_extract_issue_number(body, expected):
     assert github.extract_issue_number(body) == expected
+
+
+@pytest.mark.asyncio
+async def test_merge_state_waits_for_github_calculation(monkeypatch):
+    responses = iter([
+        {"mergeable": None, "mergeable_state": "unknown"},
+        {"mergeable": False, "mergeable_state": "dirty"},
+    ])
+
+    async def fake_get_pr(*args):
+        return next(responses)
+
+    async def no_sleep(*args):
+        return None
+
+    monkeypatch.setattr(github, "get_pr", fake_get_pr)
+    monkeypatch.setattr(github.asyncio, "sleep", no_sleep)
+    assert await github.get_pr_merge_state("token", "owner/repo", 1) == "dirty"
