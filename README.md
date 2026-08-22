@@ -14,7 +14,8 @@ and merges the exact reviewed commit when the change is complete.
 4. The worker refreshes the PR, requires `Closes #N`, `Fixes #N`, or
    `Resolves #N`, loads the issue and diff, and combines GitHub Checks with
    commit statuses.
-5. Gemini returns a validated, fail-closed review decision.
+5. DeepSeek returns a validated, fail-closed review decision. Gemini is used
+   automatically if DeepSeek is temporarily unavailable or returns invalid output.
 6. Incomplete changes receive a review that tags the contributor and explains
    what to fix. Complete changes are approved and merged only if the PR still
    points to the reviewed SHA.
@@ -39,8 +40,12 @@ Copy `.env.example` to `.env` for local development. Never commit `.env`.
 ```env
 TELEGRAM_BOT_TOKEN=...
 ENCRYPTION_KEY=...
+DEEPSEEK_API_KEY=...
+DEEPSEEK_MODEL=deepseek-v4-flash
 GEMINI_API_KEY=...
 GEMINI_REQUEST_INTERVAL_SECONDS=15
+AI_MAX_DIFF_CHARS=100000
+AI_MAX_OUTPUT_TOKENS=2048
 PUBLIC_URL=https://your-service.example
 GITHUB_WEBHOOK_SECRET=a-random-value-at-least-32-characters-long
 DATABASE_URL=postgresql://user:password@host/database
@@ -93,6 +98,7 @@ CI completion events.
 - A push during review invalidates the decision.
 - The merge API is pinned to the reviewed SHA and still respects GitHub branch
   protection.
+- DeepSeek is primary and Gemini is fallback; failure of both keeps work queued.
 - Model responses must match the expected types; invalid output never approves.
 
 AI review reduces maintainer work but is not a mathematical proof of correctness.

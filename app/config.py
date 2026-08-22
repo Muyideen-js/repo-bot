@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 REQUIRED_SETTINGS = (
     "TELEGRAM_BOT_TOKEN",
     "ENCRYPTION_KEY",
+    "DEEPSEEK_API_KEY",
     "GEMINI_API_KEY",
     "PUBLIC_URL",
     "GITHUB_WEBHOOK_SECRET",
