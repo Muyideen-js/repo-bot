@@ -91,6 +91,8 @@ Use an HTTPS tunnel as `PUBLIC_URL` when testing GitHub webhooks locally.
    worker are intentionally single-instance in this version.
 6. Verify `GET /health`, then open Telegram and run `/setup` and `/addrepo`.
 
+The root URL supports lightweight `HEAD` checks for external uptime monitors.
+
 On startup, the service updates previously registered hooks so they also receive
 CI completion events. It also scans all active repositories every five minutes;
 each new PR head SHA becomes a separate review job, while an already reviewed
