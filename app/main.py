@@ -7,7 +7,7 @@ import asyncio
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -88,6 +88,12 @@ async def health():
         "service": "GitHub PR Review Bot",
         "telegram": "active",
     }
+
+
+@app.head("/", status_code=204)
+async def health_head():
+    """Support free uptime monitors that use lightweight HEAD requests."""
+    return Response(status_code=204)
 
 
 @app.get("/health")
