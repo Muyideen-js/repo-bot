@@ -16,7 +16,11 @@ from app.models.database import init_db
 from app.config import validate_settings
 from app.handlers.webhook import router as webhook_router
 from app.handlers.telegram_bot import build_telegram_app
-from app.services.review_queue import review_worker, sync_registered_webhooks
+from app.services.review_queue import (
+    repository_poller,
+    review_worker,
+    sync_registered_webhooks,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -51,12 +55,13 @@ async def lifespan(app: FastAPI):
 
     stop_event = asyncio.Event()
     worker_task = asyncio.create_task(review_worker(stop_event), name="review-worker")
+    poller_task = asyncio.create_task(repository_poller(stop_event), name="repository-poller")
     hook_sync_task = asyncio.create_task(sync_registered_webhooks(), name="webhook-sync")
 
     yield
 
     stop_event.set()
-    await worker_task
+    await asyncio.gather(worker_task, poller_task)
     if not hook_sync_task.done():
         hook_sync_task.cancel()
     await asyncio.gather(hook_sync_task, return_exceptions=True)

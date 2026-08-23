@@ -1,6 +1,7 @@
 """Durable review queue and background worker."""
 import asyncio
 import logging
+import os
 from datetime import datetime, timedelta
 
 from sqlalchemy import select
@@ -75,6 +76,48 @@ async def enqueue_all_open_prs(token: str, repo_full_name: str) -> tuple[int, in
     for pr in pull_requests:
         scheduled += int(await enqueue_pr(repo_full_name, pr))
     return len(pull_requests), scheduled
+
+
+async def repository_poller(stop_event: asyncio.Event) -> None:
+    """Periodically discover new PR head commits when webhooks are absent or delayed."""
+    interval = max(60, int(os.getenv("PR_POLL_SECONDS", "300")))
+    while not stop_event.is_set():
+        try:
+            await _scan_monitored_repositories_once()
+        except Exception:
+            logger.exception("PR fallback scan cycle failed")
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            pass
+
+
+async def _scan_monitored_repositories_once() -> None:
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(Repo).where(Repo.active.is_(True)))
+        repos = result.scalars().all()
+        if not repos:
+            return
+        user_result = await db.execute(
+            select(User).where(User.telegram_id.in_({repo.telegram_id for repo in repos}))
+        )
+        users = {user.telegram_id: user for user in user_result.scalars().all()}
+
+    for repo in repos:
+        user = users.get(repo.telegram_id)
+        if not user or not user.github_token_encrypted:
+            continue
+        try:
+            discovered, scheduled = await enqueue_all_open_prs(
+                decrypt_token(user.github_token_encrypted), repo.full_name
+            )
+            if scheduled:
+                logger.info(
+                    "PR fallback scan repo=%s open=%s newly_scheduled=%s",
+                    repo.full_name, discovered, scheduled,
+                )
+        except Exception as exc:
+            logger.error("PR fallback scan failed for %s: %s", repo.full_name, exc)
 
 
 async def wake_jobs_for_sha(repo_full_name: str, sha: str) -> None:

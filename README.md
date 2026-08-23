@@ -11,6 +11,8 @@ and merges the exact reviewed commit when the change is complete.
 2. `/addrepo` installs a signed GitHub webhook and immediately queues every
    existing open PR in the selected repository.
 3. New commits and completed CI checks enqueue or wake an idempotent review job.
+   A five-minute fallback scan also discovers contributor repushes when webhook
+   delivery is unavailable or delayed.
 4. The worker refreshes the PR, requires `Closes #N`, `Fixes #N`, or
    `Resolves #N`, loads the issue and diff, and combines GitHub Checks with
    commit statuses.
@@ -52,6 +54,7 @@ AUTO_RESOLVE_CONFLICTS=true
 AUTO_RESOLVE_MAX_ATTEMPTS=2
 PUBLIC_URL=https://your-service.example
 GITHUB_WEBHOOK_SECRET=a-random-value-at-least-32-characters-long
+PR_POLL_SECONDS=300
 DATABASE_URL=postgresql://user:password@host/database
 ```
 
@@ -89,7 +92,9 @@ Use an HTTPS tunnel as `PUBLIC_URL` when testing GitHub webhooks locally.
 6. Verify `GET /health`, then open Telegram and run `/setup` and `/addrepo`.
 
 On startup, the service updates previously registered hooks so they also receive
-CI completion events.
+CI completion events. It also scans all active repositories every five minutes;
+each new PR head SHA becomes a separate review job, while an already reviewed
+commit is never duplicated.
 
 ## Safety properties
 

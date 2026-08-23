@@ -26,3 +26,5 @@ def validate_settings() -> None:
         raise RuntimeError("GITHUB_WEBHOOK_SECRET must be a strong random value")
     if len(os.environ["GITHUB_WEBHOOK_SECRET"]) < 32:
         raise RuntimeError("GITHUB_WEBHOOK_SECRET must be at least 32 characters")
+    if int(os.getenv("PR_POLL_SECONDS", "300")) < 60:
+        raise RuntimeError("PR_POLL_SECONDS must be at least 60")
